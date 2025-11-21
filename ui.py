@@ -1,18 +1,32 @@
-import streamlit as st
+"""Streamlit UI for the Fantasy Premier League assistant.
+
+This UI is deliberately lightweight and delegates all football logic to
+``fpl_assistant.py``.  It focuses on styling, manager selection and presenting
+the returned DataFrames in Dutch.  Network calls to the public FPL API happen
+in the imported module, so running this app requires network access to
+``fantasy.premierleague.com``.
+"""
+
 import pandas as pd
+import streamlit as st
+
 from fpl_assistant import (
-    load_bootstrap, load_fixtures,
-    generate_transfer_suggestions, build_wildcard_team,
-    suggest_transfer_moves, suggest_chip_play
+    build_wildcard_team,
+    generate_transfer_suggestions,
+    infer_current_gameweek,
+    load_bootstrap,
+    load_fixtures,
+    suggest_chip_play,
+    suggest_transfer_moves,
 )
 
 # --- Manager mapping ---
 manager_map = {
     "Brandon": 1548623,
-    "Elwin" : 3979149,
+    "Elwin": 3979149,
     "Abdel": 4023757,
     "Bart": 2111015,
-    "Nick": 3977511
+    "Nick": 3977511,
 }
 
 # --- Page setup ---
@@ -69,7 +83,12 @@ load_css(dark=dark_mode)
 selected_manager = st.sidebar.selectbox("Manager", list(manager_map.keys()))
 manager_id = manager_map[selected_manager]
 
-gameweek = st.sidebar.number_input("Gameweek", min_value=1, value=6, step=1)
+with st.spinner("FPL data ophalen..."):
+    players_df, teams_df = load_bootstrap()
+    fixtures_df = load_fixtures()
+
+current_gw = infer_current_gameweek(fixtures_df)
+gameweek = st.sidebar.number_input("Gameweek", min_value=1, value=int(current_gw), step=1)
 
 # --- Title ---
 st.markdown(
@@ -101,11 +120,6 @@ def color_fixtures(fixtures_str: str) -> str:
             color = "red"
         styled.append(f"<span style='color:{color}; font-weight:bold'>{p}</span>")
     return " | ".join(styled)
-
-# --- Load data ---
-with st.spinner("FPL data ophalen..."):
-    players_df, teams_df = load_bootstrap()
-    fixtures_df = load_fixtures()
 
 # --- Tabs ---
 tab1, tab2, tab3, tab4 = st.tabs(

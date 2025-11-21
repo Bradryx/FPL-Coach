@@ -25,6 +25,7 @@ import argparse
 import json
 import sys
 from collections import defaultdict
+from datetime import datetime, timezone
 
 try:
     import pandas as pd  # type: ignore
@@ -63,6 +64,39 @@ def load_bootstrap() -> tuple[pd.DataFrame, pd.DataFrame]:
     return players_df, teams_df
 
 
+def infer_current_gameweek(fixtures: pd.DataFrame) -> int:
+    """Infer the current/next gameweek from the fixtures feed.
+
+    The FPL API includes a ``finished`` flag per fixture. We pick the
+    smallest event number that is not finished. If all fixtures are finished
+    (e.g. off‑season), we fall back to the highest known event. When no event
+    is available, return 1.
+    """
+
+    fixtures_with_event = fixtures.dropna(subset=["event"]).copy()
+    if fixtures_with_event.empty:
+        return 1
+
+    fixtures_with_event["event"] = fixtures_with_event["event"].astype(int)
+
+    if "finished" in fixtures_with_event.columns:
+        unfinished = fixtures_with_event[fixtures_with_event["finished"] == False]
+    else:
+        # Fallback based on kickoff time when the finished flag is missing
+        if "kickoff_time" in fixtures_with_event.columns:
+            now = datetime.now(timezone.utc)
+            with_times = fixtures_with_event.dropna(subset=["kickoff_time"]).copy()
+            with_times["kickoff_time_dt"] = pd.to_datetime(with_times["kickoff_time"])
+            unfinished = with_times[with_times["kickoff_time_dt"] > now]
+        else:
+            unfinished = pd.DataFrame()
+
+    if not unfinished.empty:
+        return int(unfinished["event"].min())
+
+    return int(fixtures_with_event["event"].max())
+
+
 def load_fixtures() -> pd.DataFrame:
     """Load fixture list and convert to DataFrame."""
     fixtures = fetch_json("https://fantasy.premierleague.com/api/fixtures/")
@@ -79,23 +113,33 @@ def load_picks(manager_id: int, gameweek: int) -> dict:
 
 
 def compute_fdr_for_team(
-    team_id: int, fixtures: pd.DataFrame, weeks_ahead: int = 6
+    team_id: int, fixtures: pd.DataFrame, start_gameweek: int, weeks_ahead: int = 6
 ) -> float:
     """Compute the average fixture difficulty for a team over the next N weeks.
 
     The `fixtures` DataFrame should come from the fixtures endpoint and
     contain the columns `event`, `team_h`, `team_a` and `difficulty` (for both
     home and away teams).  Difficulty ratings are 1–5 where 5 is hardest
-    according to the official FPL Fixture Difficulty Rating【271463546749381†L119-L136】.
+    according to the official FPL Fixture Difficulty Rating.
     """
-    current_gw = fixtures["event"].min()
-    upcoming = fixtures[(fixtures["event"] >= current_gw) & (fixtures["event"] < current_gw + weeks_ahead)]
-    difficulties = []
+    # Some fixtures may not yet be assigned to a gameweek (event is null).
+    fixtures_with_event = fixtures.dropna(subset=["event"]).copy()
+    fixtures_with_event["event"] = fixtures_with_event["event"].astype(int)
+    events = fixtures_with_event["event"]
+    if events.empty:
+        return 0.0
+    # Clamp the window to the current gameweek and upcoming range.
+    current_gw = max(start_gameweek, events.min())
+    upcoming = fixtures_with_event[
+        (fixtures_with_event["event"] >= current_gw)
+        & (fixtures_with_event["event"] < current_gw + weeks_ahead)
+    ]
+    difficulties: list[float] = []
     for _, row in upcoming.iterrows():
         if row["team_h"] == team_id:
-            difficulties.append(row["team_h_difficulty"])
+            difficulties.append(float(row["team_h_difficulty"]))
         if row["team_a"] == team_id:
-            difficulties.append(row["team_a_difficulty"])
+            difficulties.append(float(row["team_a_difficulty"]))
     return sum(difficulties) / len(difficulties) if difficulties else 0.0
 
 
@@ -128,7 +172,7 @@ def generate_transfer_suggestions(
     # Compute FDR per team for the next six weeks
     fdr_map: dict[int, float] = {}
     for team_id in merged["team"].unique():
-        fdr_map[team_id] = compute_fdr_for_team(team_id, fixtures_df, weeks_ahead=6)
+        fdr_map[team_id] = compute_fdr_for_team(team_id, fixtures_df, start_gameweek=gameweek, weeks_ahead=6)
     merged["fdr_next6"] = merged["team"].map(fdr_map)
 
     # Exclude players already owned and those unavailable (status != 'a')
@@ -175,9 +219,8 @@ def generate_transfer_suggestions(
     team_lookup = teams_df.set_index("id")["short_name"].to_dict()
     top["Team"] = top["team"].map(team_lookup)
     # Determine current gameweek from fixtures to align upcoming fixtures
-    current_gw = fixtures_df["event"].min()
     top["Fixtures"] = top.apply(
-        lambda row: get_upcoming_fixtures(int(row["team"]), fixtures_df, teams_df, current_gw=current_gw, num_games=5),
+        lambda row: get_upcoming_fixtures(int(row["team"]), fixtures_df, teams_df, current_gw=gameweek, num_games=5),
         axis=1,
     )
     # Drop internal 'team' column as it is now represented by 'Team'
@@ -237,7 +280,7 @@ def suggest_transfer_moves(
     # Compute FDR per team for next six weeks
     fdr_map: dict[int, float] = {}
     for team_id in merged["team"].unique():
-        fdr_map[team_id] = compute_fdr_for_team(team_id, fixtures_df, weeks_ahead=6)
+        fdr_map[team_id] = compute_fdr_for_team(team_id, fixtures_df, start_gameweek=gameweek, weeks_ahead=6)
     merged["fdr_next6"] = merged["team"].map(fdr_map)
     merged["points_per_game"] = merged["points_per_game"].astype(float)
     # Minutes ratio to penalise low‑minute players.  Use gameweek to compute max
@@ -351,7 +394,7 @@ def suggest_chip_play(
     # Compute FDR per team
     fdr_map: dict[int, float] = {}
     for team_id in merged["team"].unique():
-        fdr_map[team_id] = compute_fdr_for_team(team_id, fixtures_df, weeks_ahead=6)
+        fdr_map[team_id] = compute_fdr_for_team(team_id, fixtures_df, start_gameweek=gameweek, weeks_ahead=6)
     current_df["fdr_next6"] = current_df["team"].map(fdr_map)
     unavailable = current_df[current_df["status"] != "a"]
     avg_fdr = current_df["fdr_next6"].mean() if not current_df.empty else 0.0
@@ -435,7 +478,7 @@ def build_wildcard_team(
     # Compute FDR map
     fdr_map: dict[int, float] = {}
     for team_id in merged["team"].unique():
-        fdr_map[team_id] = compute_fdr_for_team(team_id, fixtures_df, weeks_ahead)
+        fdr_map[team_id] = compute_fdr_for_team(team_id, fixtures_df, start_gameweek=gameweek, weeks_ahead=weeks_ahead)
     merged["fdr_next"] = merged["team"].map(fdr_map)
     merged["points_per_game"] = merged["points_per_game"].astype(float)
     # Minutes ratio penalises players with limited playing time
@@ -496,9 +539,8 @@ def build_wildcard_team(
     selected_df["Team"] = selected_df["team"].map(team_lookup)
     # Compute upcoming fixtures string for each selected player
     # Determine current gameweek from fixtures
-    current_gw = fixtures_df["event"].min()
     selected_df["Fixtures"] = selected_df.apply(
-        lambda row: get_upcoming_fixtures(int(row["team"]), fixtures_df, teams_df, current_gw=current_gw, num_games=5),
+        lambda row: get_upcoming_fixtures(int(row["team"]), fixtures_df, teams_df, current_gw=gameweek, num_games=5),
         axis=1,
     )
     # Rename stats columns for readability
@@ -536,10 +578,13 @@ def get_upcoming_fixtures(
     official FDR rating.  Fixtures are drawn from events on or after the
     current gameweek and sorted by event.
     """
+    # Normalise event numbers to ints and drop fixtures without an assigned gameweek
+    fixtures_with_event = fixtures.dropna(subset=["event"]).copy()
+    fixtures_with_event["event"] = fixtures_with_event["event"].astype(int)
     # Filter for upcoming fixtures for this team
-    upcoming = fixtures[(fixtures["event"] >= current_gw) & (
-        (fixtures["team_h"] == team_id) | (fixtures["team_a"] == team_id)
-    )].sort_values("event")
+    upcoming = fixtures_with_event[(fixtures_with_event["event"] >= current_gw) & (
+        (fixtures_with_event["team_h"] == team_id) | (fixtures_with_event["team_a"] == team_id)
+    )].sort_values(["event", "kickoff_time"])
     summaries: list[str] = []
     # Build a lookup for team short names
     team_lookup = teams_df.set_index("id")["short_name"].to_dict()
