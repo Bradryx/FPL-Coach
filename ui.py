@@ -82,7 +82,12 @@ load_css(dark=dark_mode)
 selected_manager = st.sidebar.selectbox("Manager", list(manager_map.keys()))
 manager_id = manager_map[selected_manager]
 
-gameweek = st.sidebar.number_input("Gameweek", min_value=1, value=6, step=1)
+with st.spinner("FPL data ophalen..."):
+    players_df, teams_df = load_bootstrap()
+    fixtures_df = load_fixtures()
+
+current_gw = infer_current_gameweek(fixtures_df)
+gameweek = st.sidebar.number_input("Gameweek", min_value=1, value=int(current_gw), step=1)
 
 # --- Title ---
 st.markdown(
@@ -114,11 +119,6 @@ def color_fixtures(fixtures_str: str) -> str:
             color = "red"
         styled.append(f"<span style='color:{color}; font-weight:bold'>{p}</span>")
     return " | ".join(styled)
-
-# --- Load data ---
-with st.spinner("FPL data ophalen..."):
-    players_df, teams_df = load_bootstrap()
-    fixtures_df = load_fixtures()
 
 # --- Tabs ---
 tab1, tab2, tab3, tab4 = st.tabs(

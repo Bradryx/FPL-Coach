@@ -25,6 +25,7 @@ import argparse
 import json
 import sys
 from collections import defaultdict
+from datetime import datetime, timezone
 
 try:
     import pandas as pd  # type: ignore
@@ -61,6 +62,39 @@ def load_bootstrap() -> tuple[pd.DataFrame, pd.DataFrame]:
     players_df = pd.DataFrame(data["elements"])
     teams_df = pd.DataFrame(data["teams"])
     return players_df, teams_df
+
+
+def infer_current_gameweek(fixtures: pd.DataFrame) -> int:
+    """Infer the current/next gameweek from the fixtures feed.
+
+    The FPL API includes a ``finished`` flag per fixture. We pick the
+    smallest event number that is not finished. If all fixtures are finished
+    (e.g. off‑season), we fall back to the highest known event. When no event
+    is available, return 1.
+    """
+
+    fixtures_with_event = fixtures.dropna(subset=["event"]).copy()
+    if fixtures_with_event.empty:
+        return 1
+
+    fixtures_with_event["event"] = fixtures_with_event["event"].astype(int)
+
+    if "finished" in fixtures_with_event.columns:
+        unfinished = fixtures_with_event[fixtures_with_event["finished"] == False]
+    else:
+        # Fallback based on kickoff time when the finished flag is missing
+        if "kickoff_time" in fixtures_with_event.columns:
+            now = datetime.now(timezone.utc)
+            with_times = fixtures_with_event.dropna(subset=["kickoff_time"]).copy()
+            with_times["kickoff_time_dt"] = pd.to_datetime(with_times["kickoff_time"])
+            unfinished = with_times[with_times["kickoff_time_dt"] > now]
+        else:
+            unfinished = pd.DataFrame()
+
+    if not unfinished.empty:
+        return int(unfinished["event"].min())
+
+    return int(fixtures_with_event["event"].max())
 
 
 def load_fixtures() -> pd.DataFrame:
