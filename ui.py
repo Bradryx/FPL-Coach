@@ -13,7 +13,6 @@ import streamlit as st
 from fpl_assistant import (
     build_wildcard_team,
     generate_transfer_suggestions,
-    infer_current_gameweek,
     load_bootstrap,
     load_fixtures,
     suggest_chip_play,

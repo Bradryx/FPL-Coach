@@ -1,10 +1,6 @@
 import pandas as pd
 
-from fpl_assistant import (
-    compute_fdr_for_team,
-    get_upcoming_fixtures,
-    infer_current_gameweek,
-)
+from fpl_assistant import compute_fdr_for_team, get_upcoming_fixtures
 
 
 def test_compute_fdr_for_team_respects_gameweek_window():
@@ -97,26 +93,3 @@ def test_get_upcoming_fixtures_formats_and_limits_results():
 
     # Sorted by event (and kickoff_time within the same event) and limited to two entries
     assert fixtures_str == "DEF (H,3); GHI (H,2)"
-
-
-def test_infer_current_gameweek_prefers_unfinished_fixtures():
-    fixtures = pd.DataFrame(
-        [
-            {"event": 1, "finished": True},
-            {"event": 2, "finished": False},
-            {"event": 3, "finished": False},
-        ]
-    )
-
-    assert infer_current_gameweek(fixtures) == 2
-
-
-def test_infer_current_gameweek_falls_back_to_latest_when_finished():
-    fixtures = pd.DataFrame(
-        [
-            {"event": 1, "finished": True},
-            {"event": 2, "finished": True},
-        ]
-    )
-
-    assert infer_current_gameweek(fixtures) == 2
