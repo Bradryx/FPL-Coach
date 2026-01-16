@@ -208,21 +208,32 @@ def compute_fdr_for_team(
     team_id: int,
     fixtures: pd.DataFrame,
     start_gameweek: int,
-    weeks_ahead: int = 5,
+    fixtures_ahead: int = 5,
+    weeks_ahead: Optional[int] = None,
 ) -> Optional[float]:
-    """Average FDR for `team_id` in a GW window (inclusive)."""
+    """Average FDR for `team_id` over the next N fixtures.
+
+    This is fixture-count based (not week-count based), so it naturally handles
+    blanks/double gameweeks.
+    """
     if fixtures is None or fixtures.empty:
         return None
 
-    end_gw = int(start_gameweek) + max(int(weeks_ahead), 1) - 1
+    # Backwards-compat: earlier versions used "weeks_ahead" (keyword) for this window.
+    if weeks_ahead is not None:
+        fixtures_ahead = weeks_ahead
+
+    n = max(1, int(fixtures_ahead))
+
     f = fixtures.copy()
     f = f[f["event"].notna()]
-    f = f[(f["event"] >= int(start_gameweek)) & (f["event"] <= end_gw)]
-
-    mask = (f["team_h"] == int(team_id)) | (f["team_a"] == int(team_id))
-    f = f[mask]
+    f = f[f["event"] >= int(start_gameweek)]
+    f = f[(f["team_h"] == int(team_id)) | (f["team_a"] == int(team_id))]
     if f.empty:
         return None
+
+    sort_cols = ["event"] + (["kickoff_time"] if "kickoff_time" in f.columns else [])
+    f = f.sort_values(sort_cols, na_position="last").head(n)
 
     def _row_diff(row) -> float:
         if int(row["team_h"]) == int(team_id):
@@ -318,7 +329,7 @@ def _score_players(
     teams_df: pd.DataFrame,
     fixtures_df: pd.DataFrame,
     current_gw: int,
-    weeks_ahead: int = 5,
+    fixtures_ahead: int = 5,
 ) -> pd.DataFrame:
     """Players df with columns: name, team_short, position, price, fdr, upcoming, score."""
     df = players_df.copy()
@@ -337,12 +348,14 @@ def _score_players(
     df["price"] = df["now_cost"].apply(lambda c: _safe_float(c) / 10.0)
 
     def _fdr(team_id: int) -> float:
-        v = compute_fdr_for_team(team_id, fixtures_df, int(fdr_start_gw), int(weeks_ahead))
+        v = compute_fdr_for_team(team_id, fixtures_df, int(fdr_start_gw), int(fixtures_ahead))
         return float(v) if v is not None else 3.0
 
     df["fdr"] = df["team"].apply(lambda t: _fdr(int(t)) if pd.notna(t) else 3.0)
+    # Show a short upcoming list; tie it to the fixture window, but keep it readable.
+    upcoming_n = min(6, max(1, int(fixtures_ahead)))
     df["upcoming"] = df["team"].apply(
-        lambda t: get_upcoming_fixtures(int(t), fixtures_df, teams_df, int(current_gw), 3) if pd.notna(t) else ""
+        lambda t: get_upcoming_fixtures(int(t), fixtures_df, teams_df, int(current_gw), upcoming_n) if pd.notna(t) else ""
     )
 
     ep_next = df["ep_next"].apply(_safe_float)
@@ -369,11 +382,18 @@ def show_current_team(
     players_df: pd.DataFrame,
     teams_df: pd.DataFrame,
     fixtures_df: pd.DataFrame,
+    fixtures_ahead: int = 5,
 ) -> pd.DataFrame:
     picks = load_entry_picks(int(manager_id), int(gameweek))
     element_ids = [p["element"] for p in picks.get("picks", [])]
 
-    scored = _score_players(players_df, teams_df, fixtures_df, current_gw=int(gameweek))
+    scored = _score_players(
+        players_df,
+        teams_df,
+        fixtures_df,
+        current_gw=int(gameweek),
+        fixtures_ahead=int(fixtures_ahead),
+    )
     squad = scored[scored["id"].isin(element_ids)].copy()
 
     order = {eid: i for i, eid in enumerate(element_ids)}
@@ -391,13 +411,20 @@ def generate_transfer_suggestions(
     players_df: pd.DataFrame,
     teams_df: pd.DataFrame,
     fixtures_df: pd.DataFrame,
+    fixtures_ahead: int = 5,
     top_n: int = 10,
 ) -> pd.DataFrame:
     """Top target players excluding your current 15-man squad."""
     picks = load_entry_picks(int(manager_id), int(gameweek))
     element_ids = {p["element"] for p in picks.get("picks", [])}
 
-    scored = _score_players(players_df, teams_df, fixtures_df, current_gw=int(gameweek))
+    scored = _score_players(
+        players_df,
+        teams_df,
+        fixtures_df,
+        current_gw=int(gameweek),
+        fixtures_ahead=int(fixtures_ahead),
+    )
     targets = scored[~scored["id"].isin(element_ids)].copy()
     targets = targets[targets["is_available"]]
 
@@ -422,7 +449,14 @@ def suggest_transfer_moves(
 
     bank_tenths = int(picks.get("entry_history", {}).get("bank", 0) or 0)
 
-    scored = _score_players(players_df, teams_df, fixtures_df, current_gw=int(gameweek), weeks_ahead=int(weeks_ahead))
+    # NOTE: "weeks_ahead" is treated as a *fixture count* window for FDR/scoring.
+    scored = _score_players(
+        players_df,
+        teams_df,
+        fixtures_df,
+        current_gw=int(gameweek),
+        fixtures_ahead=int(weeks_ahead),
+    )
     scored = scored[scored["is_available"]].copy()
 
     squad = scored[scored["id"].isin(squad_ids)].copy()
@@ -489,7 +523,14 @@ def build_wildcard_team(
     weeks_ahead: int = 5,
 ) -> pd.DataFrame:
     """Build a simple 15-player wildcard squad (greedy heuristic)."""
-    scored = _score_players(players_df, teams_df, fixtures_df, current_gw=int(gameweek), weeks_ahead=int(weeks_ahead))
+    # NOTE: "weeks_ahead" is treated as a *fixture count* window for FDR/scoring.
+    scored = _score_players(
+        players_df,
+        teams_df,
+        fixtures_df,
+        current_gw=int(gameweek),
+        fixtures_ahead=int(weeks_ahead),
+    )
     scored = scored[scored["is_available"]].copy()
 
     budget_t = int(round(float(budget_m) * 10))

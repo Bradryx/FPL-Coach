@@ -4,6 +4,7 @@ import pandas as pd
 from fpl_assistant import (
     load_bootstrap,
     load_fixtures,
+    get_current_gameweek,
     generate_transfer_suggestions,
     build_wildcard_team,
     suggest_transfer_moves,
@@ -28,15 +29,50 @@ except Exception as e:
 # bootstrap-static contains 'events' but we didn't return it; quick re-fetch is wasteful.
 # Instead: let user choose, with a sensible default.
 
-manager_id = st.number_input("Manager ID", min_value=1, value=1548623, step=1)
-gameweek = st.number_input("Gameweek", min_value=1, value=6, step=1)
+MANAGERS = {
+    "Custom": None,
+    "Brandon": 1548623,
+    "Elwin": 3979149,
+    "Abdel": 4023757,
+    "Bart": 2111015,
+    "Nick": 3977511,
+}
+
+manager_choice = st.selectbox("Manager", list(MANAGERS.keys()), index=1)
+default_manager_id = MANAGERS.get(manager_choice) or 1548623
+manager_id = st.number_input(
+    "Manager ID",
+    min_value=1,
+    value=int(default_manager_id),
+    step=1,
+    disabled=(manager_choice != "Custom"),
+)
+
+default_gw = int(get_current_gameweek())
+gameweek = st.number_input("Gameweek", min_value=1, value=default_gw, step=1)
+
+fixtures_ahead = st.slider(
+    "Aantal upcoming fixtures voor FDR/scoring",
+    min_value=1,
+    max_value=10,
+    value=5,
+    step=1,
+)
 
 col1, col2, col3, col4, col5 = st.columns(5)
 
 with col1:
     if st.button("Show Current Team"):
         try:
-            team_df = show_current_team(manager_id, gameweek, players_df, teams_df, fixtures_df)
+            team_df = show_current_team(
+                manager_id,
+                gameweek,
+                players_df,
+                teams_df,
+                fixtures_df,
+                fixtures_ahead=int(fixtures_ahead),
+            )
+            
             st.subheader("Current Team")
             st.dataframe(team_df, use_container_width=True)
         except Exception as e:
@@ -46,7 +82,13 @@ with col2:
     if st.button("Show Transfer Suggestions"):
         try:
             suggestions = generate_transfer_suggestions(
-                manager_id, gameweek, players_df, teams_df, fixtures_df, top_n=10
+                manager_id,
+                gameweek,
+                players_df,
+                teams_df,
+                fixtures_df,
+                fixtures_ahead=int(fixtures_ahead),
+                top_n=10,
             )
             st.subheader("Transfer Targets")
             st.dataframe(suggestions, use_container_width=True)
@@ -56,7 +98,14 @@ with col2:
 with col3:
     if st.button("Suggest Transfer Moves"):
         try:
-            moves = suggest_transfer_moves(manager_id, gameweek, players_df, teams_df, fixtures_df)
+            moves = suggest_transfer_moves(
+                manager_id,
+                gameweek,
+                players_df,
+                teams_df,
+                fixtures_df,
+                weeks_ahead=int(fixtures_ahead),
+            )
             st.subheader("Transfer Moves")
             if moves:
                 for sell, buy, delta in moves:
@@ -69,7 +118,14 @@ with col3:
 with col4:
     if st.button("Build Wildcard Squad"):
         try:
-            squad = build_wildcard_team(manager_id, gameweek, players_df, teams_df, fixtures_df)
+            squad = build_wildcard_team(
+                manager_id,
+                gameweek,
+                players_df,
+                teams_df,
+                fixtures_df,
+                weeks_ahead=int(fixtures_ahead),
+            )
             st.subheader("Wildcard Squad")
             st.caption(
                 f"Budget spent: {squad.attrs.get('budget_spent_m', 0):.1f}m | "
