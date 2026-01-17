@@ -304,7 +304,11 @@ def _score_players(
     fixtures_ahead: int = 5,
     skip_current_gw: bool = True,
 ) -> pd.DataFrame:
-    """Players df with: name, team_short, position, price, fdr, upcoming, score."""
+    """Return players df with helper columns used by the UI and planners.
+
+    - expected_points: points-like signal (NOT normalized by price)
+    - score: value-like signal (normalized by price)
+    """
     df = players_df.copy()
 
     fdr_start_gw = int(current_gw) + (1 if skip_current_gw else 0)
@@ -334,8 +338,10 @@ def _score_players(
     fdr_mult = 1.25 - ((df["fdr"].clip(1, 5) - 1) * (0.5 / 4.0))
 
     raw = (ep_next * 0.60) + (form * 0.25) + (ppg * 0.15)
-    # Normalize by price so that pure points don't always prefer premiums
-    df["score"] = (raw * fdr_mult) / (df["price"].replace(0, pd.NA)).fillna(4.5)
+    df["expected_points"] = raw * fdr_mult
+
+    # Value-like score (kept for the existing tables)
+    df["score"] = df["expected_points"] / (df["price"].replace(0, pd.NA)).fillna(4.5)
 
     # Availability
     df["is_available"] = True
@@ -405,7 +411,8 @@ def _priority(sell: pd.Series, buy: pd.Series, score_gain: float, delta_m: float
     status = str(sell.get("status") or "").lower().strip()
 
     injured_flag = (status not in ["a", "d"]) or (chance and chance < 75)
-    big_gain = score_gain >= 0.15
+    # score_gain is in "expected_points" units, typically ~0..3
+    big_gain = score_gain >= 1.0
     frees_cash = delta_m <= -1.0
 
     if injured_flag:
@@ -414,10 +421,10 @@ def _priority(sell: pd.Series, buy: pd.Series, score_gain: float, delta_m: float
     elif big_gain:
         pr = "P1"
         reason = "Grote upgrade in score."
-    elif frees_cash and score_gain >= 0.05:
+    elif frees_cash and score_gain >= 0.4:
         pr = "P2"
         reason = "Budget enabler die ook punten helpt."
-    elif score_gain >= 0.08:
+    elif score_gain >= 0.5:
         pr = "P2"
         reason = "Solide upgrade in score."
     else:
@@ -473,19 +480,21 @@ def suggest_transfer_plan(
     if squad.empty or pool.empty:
         return []
 
-    # Build a strong buy pool per position (otherwise it tends to stick to cheap fillers)
+    # Build a strong buy pool per position.
+    # IMPORTANT: rank on expected_points (not value "score"), otherwise the planner
+    # over-prefers cheap 4-5m players.
     pool = pool[pool["element_type"].notna() & pool["now_cost"].notna()].copy()
     pool["now_cost_t"] = pool["now_cost"].apply(lambda x: int(round(_safe_float(x, 0.0))))
     pool_by_pos: Dict[int, pd.DataFrame] = {}
     for pos in [1, 2, 3, 4]:
-        pos_df = pool[pool["element_type"].astype(int) == pos].sort_values("score", ascending=False)
+        pos_df = pool[pool["element_type"].astype(int) == pos].sort_values("expected_points", ascending=False)
         pool_by_pos[pos] = pos_df.head(int(buy_pool_per_pos)).copy()
 
     squad = squad[squad["element_type"].notna() & squad["now_cost"].notna()].copy()
     squad["now_cost_t"] = squad["now_cost"].apply(lambda x: int(round(_safe_float(x, 0.0))))
 
     # Candidate sell list: include both (a) worst scores and (b) highest prices
-    worst = squad.sort_values("score", ascending=True).head(8)
+    worst = squad.sort_values("expected_points", ascending=True).head(8)
     expensive = squad.sort_values("now_cost_t", ascending=False).head(6)
     sell_candidates = pd.concat([worst, expensive]).drop_duplicates(subset=["id"])
 
@@ -508,7 +517,7 @@ def suggest_transfer_plan(
             # Recompute sell candidates within current state
             cur_squad = cur_squad[cur_squad["element_type"].notna() & cur_squad["now_cost"].notna()].copy()
             cur_squad["now_cost_t"] = cur_squad["now_cost"].apply(lambda x: int(round(_safe_float(x, 0.0))))
-            worst_s = cur_squad.sort_values("score", ascending=True).head(8)
+            worst_s = cur_squad.sort_values("expected_points", ascending=True).head(8)
             expensive_s = cur_squad.sort_values("now_cost_t", ascending=False).head(6)
             sells = pd.concat([worst_s, expensive_s]).drop_duplicates(subset=["id"]).to_dict("records")
 
@@ -543,14 +552,14 @@ def suggest_transfer_plan(
                     continue
 
                 # Take top few buys for branching
-                cand = cand.sort_values("score", ascending=False).head(8)
+                cand = cand.sort_values("expected_points", ascending=False).head(8)
                 for _, buy in cand.iterrows():
                     buy_id = int(buy["id"])
                     buy_team = int(buy["team"]) if pd.notna(buy.get("team")) else -1
                     buy_cost_t = int(buy["now_cost_t"])
 
                     new_bank_t = bank_t + sell_cost_t - buy_cost_t
-                    score_gain = float(_safe_float(buy.get("score")) - _safe_float(sell.get("score")))
+                    score_gain = float(_safe_float(buy.get("expected_points")) - _safe_float(sell.get("expected_points")))
                     if score_gain <= 0:
                         continue
 
