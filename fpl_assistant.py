@@ -1,23 +1,24 @@
 """Fantasy Premier League helper functions for a Streamlit UI.
 
-Safe to import (no Streamlit code).
-
 Public endpoints used:
 - /bootstrap-static/ (players, teams, events)
 - /fixtures/
 - /entry/{id}/event/{gw}/picks/
 
-Behavior:
-- FDR is computed over the next N *fixtures* (works with blanks/doubles).
-- By default, fixtures/FDR start at (gameweek + 1) to skip the current GW.
+Key behavior:
+- FDR is computed over the next N *fixtures* (handles blanks/double GWs).
+- By default we skip the current GW and start from (current_gw + 1) because the
+  first "upcoming" fixture in the current GW is often already played.
 
-This is a best-effort assistant, not a perfect optimizer.
+Limitations (public API):
+- We do not have each player's exact sell price (profit rules require auth). We
+  approximate by using the player's current price (now_cost).
 """
 
 from __future__ import annotations
 
 from functools import lru_cache
-from typing import Dict, Iterable, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import pandas as pd
 import requests
@@ -26,18 +27,17 @@ BASE_URL = "https://fantasy.premierleague.com/api"
 
 
 class FPLError(RuntimeError):
-    """Raised when the FPL public API cannot be used (HTTP, parse, etc.)."""
+    pass
 
 
 # -------------------------
 # Low-level API helpers
 # -------------------------
 
+
 def _get_json(path: str, timeout: int = 20, retries: int = 2) -> dict:
-    """GET JSON from FPL with small retries and a stable User-Agent."""
     url = path if path.startswith("http") else f"{BASE_URL}{path}"
     last_exc: Optional[Exception] = None
-
     for _ in range(max(1, int(retries) + 1)):
         try:
             r = requests.get(url, timeout=timeout, headers={"User-Agent": "fpl-streamlit-assistant"})
@@ -49,13 +49,13 @@ def _get_json(path: str, timeout: int = 20, retries: int = 2) -> dict:
             raise
         except Exception as e:
             last_exc = e
-
     raise FPLError(f"FPL request failed: {url} ({type(last_exc).__name__}: {last_exc})")
 
 
 # -------------------------
 # Bootstrap data
 # -------------------------
+
 
 @lru_cache(maxsize=1)
 def load_bootstrap() -> Tuple[pd.DataFrame, pd.DataFrame]:
@@ -139,11 +139,11 @@ def get_current_gameweek() -> int:
 # Fixtures
 # -------------------------
 
+
 @lru_cache(maxsize=1)
 def load_fixtures() -> pd.DataFrame:
     data = _get_json("/fixtures/")
     fixtures_df = pd.DataFrame(data)
-
     for col in [
         "event",
         "team_h",
@@ -154,13 +154,13 @@ def load_fixtures() -> pd.DataFrame:
     ]:
         if col not in fixtures_df.columns:
             fixtures_df[col] = pd.NA
-
     return fixtures_df
 
 
 # -------------------------
 # Entry / squad
 # -------------------------
+
 
 def load_entry_picks(manager_id: int, gameweek: int) -> dict:
     mid = int(manager_id)
@@ -169,6 +169,7 @@ def load_entry_picks(manager_id: int, gameweek: int) -> dict:
 
 
 def resolve_gameweek(manager_id: int, preferred_gameweek: int, max_fallbacks: int = 3) -> int:
+    """If the selected GW is not available for an entry, walk backwards a few GWs."""
     gw = int(preferred_gameweek)
     for _ in range(max(0, int(max_fallbacks)) + 1):
         try:
@@ -182,119 +183,172 @@ def resolve_gameweek(manager_id: int, preferred_gameweek: int, max_fallbacks: in
 
 
 # -------------------------
-# Helpers
+# Fixture difficulty helpers
 # -------------------------
 
-def _to_float(v, default: float = 0.0) -> float:
+
+def _safe_float(x, default: float = 0.0) -> float:
     try:
-        if v is None or pd.isna(v):
-            return float(default)
-        if isinstance(v, str):
-            v = v.strip().replace(",", ".")
-        return float(v)
+        if pd.isna(x):
+            return default
+        if isinstance(x, str):
+            x = x.strip().replace(",", ".")
+        return float(x)
     except Exception:
-        return float(default)
-
-
-def _name(r) -> str:
-    w = r.get("web_name")
-    if pd.notna(w) and str(w).strip():
-        return str(w)
-    fn = str(r.get("first_name") or "").strip()
-    sn = str(r.get("second_name") or "").strip()
-    full = (fn + " " + sn).strip()
-    return full if full else str(r.get("id"))
-
-
-def _position_name(element_type: int) -> str:
-    return {1: "GKP", 2: "DEF", 3: "MID", 4: "FWD"}.get(int(element_type), str(element_type))
-
-
-def _team_short_map(teams_df: pd.DataFrame) -> Dict[int, str]:
-    m: Dict[int, str] = {}
-    if teams_df is None or teams_df.empty:
-        return m
-    for _, r in teams_df.iterrows():
-        try:
-            m[int(r.get("id"))] = str(r.get("short_name") or r.get("name") or "")
-        except Exception:
-            continue
-    return m
-
-
-# -------------------------
-# FDR (next N fixtures)
-# -------------------------
-
-def get_upcoming_fixtures(
-    team_id: int,
-    fixtures_df: pd.DataFrame,
-    start_gameweek: int,
-    fixtures_ahead: int,
-) -> List[Dict]:
-    """Return the next N fixtures for a team starting from start_gameweek."""
-    if fixtures_df is None or fixtures_df.empty:
-        return []
-
-    t = int(team_id)
-    start_gw = int(start_gameweek)
-    n = max(0, int(fixtures_ahead))
-
-    f = fixtures_df.copy()
-    f = f[f["event"].notna()]
-    f["event"] = pd.to_numeric(f["event"], errors="coerce")
-    f = f[f["event"] >= start_gw]
-    f = f[(f["team_h"] == t) | (f["team_a"] == t)]
-
-    # kickoff_time sorts postponed (NaT) last
-    f["kickoff_time"] = pd.to_datetime(f["kickoff_time"], errors="coerce", utc=True)
-    f = f.sort_values(["event", "kickoff_time"], ascending=[True, True])
-
-    out: List[Dict] = []
-    for _, r in f.iterrows():
-        is_home = int(r.get("team_h")) == t
-        opp = int(r.get("team_a")) if is_home else int(r.get("team_h"))
-        diff = _to_float(r.get("team_h_difficulty" if is_home else "team_a_difficulty"), 3.0)
-        out.append({"gw": int(r.get("event")), "home": bool(is_home), "opponent": opp, "difficulty": diff})
-        if len(out) >= n:
-            break
-    return out
+        return default
 
 
 def compute_fdr_for_team(
     team_id: int,
-    fixtures_df: pd.DataFrame,
+    fixtures: pd.DataFrame,
     start_gameweek: int,
-    fixtures_ahead: int,
-) -> float:
-    fixtures = get_upcoming_fixtures(team_id, fixtures_df, start_gameweek, fixtures_ahead)
-    if not fixtures:
-        return 3.0
-    diffs = [float(x.get("difficulty", 3.0)) for x in fixtures]
-    return float(sum(diffs) / len(diffs))
+    fixtures_ahead: int = 5,
+) -> Optional[float]:
+    """Average FDR for `team_id` over the next N fixtures (fixture-count based)."""
+    if fixtures is None or fixtures.empty:
+        return None
+
+    n = max(1, int(fixtures_ahead))
+
+    f = fixtures.copy()
+    f = f[f["event"].notna()]
+    f = f[f["event"] >= int(start_gameweek)]
+    f = f[(f["team_h"] == int(team_id)) | (f["team_a"] == int(team_id))]
+    if f.empty:
+        return None
+
+    sort_cols = ["event"] + (["kickoff_time"] if "kickoff_time" in f.columns else [])
+    f = f.sort_values(sort_cols, na_position="last").head(n)
+
+    def _row_diff(row) -> float:
+        if int(row["team_h"]) == int(team_id):
+            return float(row["team_h_difficulty"])
+        return float(row["team_a_difficulty"])
+
+    diffs = f.apply(_row_diff, axis=1).astype(float)
+    return float(diffs.mean())
 
 
-def player_score(player_row, fdr_avg: float) -> float:
-    """Heuristic score; higher is better."""
-    ep = _to_float(player_row.get("ep_next"), 0.0)
-    form = _to_float(player_row.get("form"), 0.0)
-    ppg = _to_float(player_row.get("points_per_game"), 0.0)
-    status = str(player_row.get("status", "")).lower().strip()
+def get_upcoming_fixtures(
+    team_id: int,
+    fixtures: pd.DataFrame,
+    teams_df: pd.DataFrame,
+    current_gw: int,
+    num_games: int = 5,
+) -> str:
+    """Compact string of upcoming opponents for a team (starts at current_gw + 1)."""
+    if fixtures is None or fixtures.empty or teams_df is None or teams_df.empty:
+        return ""
 
-    score = (1.0 * ep) + (0.30 * form) + (0.20 * ppg) - (0.70 * float(fdr_avg))
+    teams_map = {
+        int(row["id"]): str(row.get("short_name") or row.get("name") or row.get("id"))
+        for _, row in teams_df.iterrows()
+        if pd.notna(row.get("id"))
+    }
 
-    cop = _to_float(player_row.get("chance_of_playing_next_round"), 100.0)
-    if cop and cop < 75:
-        score -= 1.0
-    if status != "a":
-        score -= 1.5
+    start_gw = int(current_gw) + 1
 
-    return float(score)
+    f = fixtures.copy()
+    f = f[f["event"].notna()]
+    f = f[f["event"] >= start_gw]
+    f = f[(f["team_h"] == int(team_id)) | (f["team_a"] == int(team_id))]
+    if f.empty:
+        return ""
+
+    sort_cols = ["event"] + (["kickoff_time"] if "kickoff_time" in f.columns else [])
+    f = f.sort_values(sort_cols, na_position="last")
+
+    parts: List[str] = []
+    for _, row in f.head(int(num_games)).iterrows():
+        is_home = int(row["team_h"]) == int(team_id)
+        opp_id = int(row["team_a"]) if is_home else int(row["team_h"])
+        opp = teams_map.get(opp_id, str(opp_id))
+        diff = float(row["team_h_difficulty"] if is_home else row["team_a_difficulty"])
+        ha = "H" if is_home else "A"
+        parts.append(f"{opp} ({ha},{int(diff)})")
+    return "; ".join(parts)
 
 
 # -------------------------
-# Team view
+# Scoring
 # -------------------------
+
+
+POSITION_NAME = {1: "GK", 2: "DEF", 3: "MID", 4: "FWD"}
+
+
+def _player_display_name(row: pd.Series) -> str:
+    wn = str(row.get("web_name") or "").strip()
+    if wn:
+        return wn
+    fn = str(row.get("first_name") or "").strip()
+    sn = str(row.get("second_name") or "").strip()
+    return (fn + " " + sn).strip() or str(row.get("id"))
+
+
+def _build_team_short_map(teams_df: pd.DataFrame) -> Dict[int, str]:
+    mp: Dict[int, str] = {}
+    for _, r in teams_df.iterrows():
+        if pd.isna(r.get("id")):
+            continue
+        tid = int(r["id"])
+        mp[tid] = str(r.get("short_name") or r.get("name") or tid)
+    return mp
+
+
+def _score_players(
+    players_df: pd.DataFrame,
+    teams_df: pd.DataFrame,
+    fixtures_df: pd.DataFrame,
+    current_gw: int,
+    fixtures_ahead: int = 5,
+    skip_current_gw: bool = True,
+) -> pd.DataFrame:
+    """Players df with: name, team_short, position, price, fdr, upcoming, score."""
+    df = players_df.copy()
+
+    fdr_start_gw = int(current_gw) + (1 if skip_current_gw else 0)
+
+    team_map = _build_team_short_map(teams_df)
+    df["name"] = df.apply(_player_display_name, axis=1)
+    df["team_short"] = df["team"].apply(lambda t: team_map.get(int(t), str(t)) if pd.notna(t) else "")
+    df["position"] = df["element_type"].apply(lambda p: POSITION_NAME.get(int(p), str(p)) if pd.notna(p) else "")
+    df["price"] = df["now_cost"].apply(lambda c: _safe_float(c) / 10.0)
+
+    def _fdr(team_id: int) -> float:
+        v = compute_fdr_for_team(team_id, fixtures_df, int(fdr_start_gw), int(fixtures_ahead))
+        return float(v) if v is not None else 3.0
+
+    df["fdr"] = df["team"].apply(lambda t: _fdr(int(t)) if pd.notna(t) else 3.0)
+    df["upcoming"] = df["team"].apply(
+        lambda t: get_upcoming_fixtures(int(t), fixtures_df, teams_df, int(current_gw), min(6, int(fixtures_ahead)))
+        if pd.notna(t)
+        else ""
+    )
+
+    ep_next = df["ep_next"].apply(_safe_float)
+    ppg = df["points_per_game"].apply(_safe_float)
+    form = df["form"].apply(_safe_float)
+
+    # Lower FDR is better; map 1..5 -> multiplier ~1.25..0.75
+    fdr_mult = 1.25 - ((df["fdr"].clip(1, 5) - 1) * (0.5 / 4.0))
+
+    raw = (ep_next * 0.60) + (form * 0.25) + (ppg * 0.15)
+    # Normalize by price so that pure points don't always prefer premiums
+    df["score"] = (raw * fdr_mult) / (df["price"].replace(0, pd.NA)).fillna(4.5)
+
+    # Availability
+    df["is_available"] = True
+    if "status" in df.columns:
+        df["is_available"] = df["status"].astype(str).isin(["a", "d"])  # a=available, d=doubtful
+
+    return df
+
+
+# -------------------------
+# UI helpers
+# -------------------------
+
 
 def show_current_team(
     manager_id: int,
@@ -303,328 +357,342 @@ def show_current_team(
     teams_df: pd.DataFrame,
     fixtures_df: pd.DataFrame,
     fixtures_ahead: int = 5,
-    bank_override_m: Optional[float] = None,
-) -> Tuple[pd.DataFrame, Dict[str, str]]:
-    gw = resolve_gameweek(int(manager_id), int(gameweek))
-    data = load_entry_picks(int(manager_id), int(gw))
+) -> pd.DataFrame:
+    picks = load_entry_picks(int(manager_id), int(gameweek))
+    element_ids = [p["element"] for p in picks.get("picks", [])]
 
-    picks = data.get("picks", []) or []
-    entry_hist = data.get("entry_history", {}) or {}
+    scored = _score_players(players_df, teams_df, fixtures_df, current_gw=int(gameweek), fixtures_ahead=int(fixtures_ahead))
+    squad = scored[scored["id"].isin(element_ids)].copy()
 
-    bank_10 = int(entry_hist.get("bank", 0) or 0)  # 0.1m units
-    value_10 = int(entry_hist.get("value", 0) or 0)  # 0.1m units
+    order = {eid: i for i, eid in enumerate(element_ids)}
+    squad["_order"] = squad["id"].map(order)
 
-    if bank_override_m is not None:
-        bank_10 = max(0, int(round(float(bank_override_m) * 10)))
-
-    team_short = _team_short_map(teams_df)
-    players_idx = players_df.set_index("id", drop=False)
-
-    start_gw = int(gw) + 1
-
-    rows = []
-    for p in picks:
-        pid = int(p.get("element"))
-        if pid not in players_idx.index:
-            continue
-        pr = players_idx.loc[pid]
-
-        team_id = int(_to_float(pr.get("team"), 0))
-        fdr = compute_fdr_for_team(team_id, fixtures_df, start_gw, int(fixtures_ahead))
-        sc = player_score(pr, fdr)
-
-        sell_10 = p.get("selling_price")
-        if sell_10 is None or pd.isna(sell_10):
-            sell_10 = pr.get("now_cost")
-        sell_10 = int(_to_float(sell_10, 0))
-
-        rows.append(
-            {
-                "Player": _name(pr),
-                "Pos": _position_name(int(_to_float(pr.get("element_type"), 0))),
-                "Team": team_short.get(team_id, str(team_id)),
-                "Status": str(pr.get("status", "")),
-                "Price": _to_float(pr.get("now_cost"), 0) / 10.0,
-                "Sell": sell_10 / 10.0,
-                "EP_next": _to_float(pr.get("ep_next"), 0.0),
-                "Form": _to_float(pr.get("form"), 0.0),
-                "FDR_avg": round(float(fdr), 2),
-                "Score": round(float(sc), 3),
-            }
-        )
-
-    squad_df = pd.DataFrame(rows)
-    if not squad_df.empty:
-        squad_df["_risk"] = (squad_df["Status"].astype(str).str.lower() != "a").astype(int)
-        squad_df = squad_df.sort_values(["_risk", "Score"], ascending=[False, True]).drop(columns=["_risk"]).reset_index(
-            drop=True
-        )
-
-    budget_info = {
-        "GW": str(gw),
-        "Bank (m)": f"{bank_10/10.0:.1f}" + (" (override)" if bank_override_m is not None else ""),
-        "Squad value (m)": f"{value_10/10.0:.1f}",
-        "FDR start GW": str(start_gw),
-        "Fixtures window": str(int(fixtures_ahead)),
-    }
-
-    return squad_df, budget_info
+    cols = ["name", "team_short", "position", "price", "total_points", "fdr", "upcoming", "score", "status"]
+    cols = [c for c in cols if c in squad.columns]
+    return squad.sort_values("_order")[cols].reset_index(drop=True)
 
 
-# -------------------------
-# Transfer suggestions
-# -------------------------
-
-def _team_counts(player_ids: Iterable[int], players_idx: pd.DataFrame) -> Dict[int, int]:
-    counts: Dict[int, int] = {}
-    for pid in player_ids:
-        if pid not in players_idx.index:
-            continue
-        t = int(_to_float(players_idx.loc[pid].get("team"), 0))
-        counts[t] = counts.get(t, 0) + 1
-    return counts
-
-
-def _priority(sell_status: str, score_gain: float) -> str:
-    s = str(sell_status).lower().strip()
-    if s and s != "a":
-        return "P1"
-    if score_gain >= 2.0:
-        return "P1"
-    if score_gain >= 1.0:
-        return "P2"
-    return "P3"
-
-
-def suggest_transfer_moves(
+def generate_transfer_suggestions(
     manager_id: int,
     gameweek: int,
     players_df: pd.DataFrame,
     teams_df: pd.DataFrame,
     fixtures_df: pd.DataFrame,
     fixtures_ahead: int = 5,
+    top_n: int = 20,
+) -> pd.DataFrame:
+    """Top transfer targets (not in squad), ranked by our score."""
+    picks = load_entry_picks(int(manager_id), int(gameweek))
+    element_ids = [p["element"] for p in picks.get("picks", [])]
+
+    scored = _score_players(players_df, teams_df, fixtures_df, current_gw=int(gameweek), fixtures_ahead=int(fixtures_ahead))
+    targets = scored[~scored["id"].isin(element_ids)].copy()
+    targets = targets[targets["is_available"]]
+
+    cols = ["name", "team_short", "position", "price", "total_points", "fdr", "upcoming", "score"]
+    cols = [c for c in cols if c in targets.columns]
+    return targets.sort_values("score", ascending=False).head(int(top_n))[cols].reset_index(drop=True)
+
+
+# -------------------------
+# Transfer planning
+# -------------------------
+
+
+def _priority(sell: pd.Series, buy: pd.Series, score_gain: float, delta_m: float) -> Tuple[str, str]:
+    """Return (priority, reason)."""
+    chance = _safe_float(sell.get("chance_of_playing_next_round"), default=100.0)
+    status = str(sell.get("status") or "").lower().strip()
+
+    injured_flag = (status not in ["a", "d"]) or (chance and chance < 75)
+    big_gain = score_gain >= 0.15
+    frees_cash = delta_m <= -1.0
+
+    if injured_flag:
+        pr = "P1"
+        reason = "Beschikbaarheid risico (injury/rotation)."
+    elif big_gain:
+        pr = "P1"
+        reason = "Grote upgrade in score."
+    elif frees_cash and score_gain >= 0.05:
+        pr = "P2"
+        reason = "Budget enabler die ook punten helpt."
+    elif score_gain >= 0.08:
+        pr = "P2"
+        reason = "Solide upgrade in score."
+    else:
+        pr = "P3"
+        reason = "Kleine upgrade / vooral optimalisatie."
+
+    # Add a short quantitative note
+    note = f"Gain {score_gain:+.2f}, budget {delta_m:+.1f}m"
+    return pr, f"{reason} ({note})"
+
+
+def _team_counts_from_ids(scored: pd.DataFrame, ids: List[int]) -> Dict[int, int]:
+    sub = scored[scored["id"].isin(ids)].copy()
+    if sub.empty:
+        return {}
+    return sub["team"].dropna().astype(int).value_counts().to_dict()
+
+
+def suggest_transfer_plan(
+    manager_id: int,
+    gameweek: int,
+    players_df: pd.DataFrame,
+    teams_df: pd.DataFrame,
+    fixtures_df: pd.DataFrame,
+    fixtures_ahead: int = 5,
+    num_transfers: int = 2,
     bank_override_m: Optional[float] = None,
-    transfers_wanted: int = 1,
-    top_candidates: int = 80,
-) -> List[Dict]:
-    """Suggest 1..N transfers.
+    top_plans: int = 3,
+    beam_width: int = 40,
+    buy_pool_per_pos: int = 40,
+) -> List[pd.DataFrame]:
+    """Return up to top_plans transfer sequences.
 
-    Args:
-        bank_override_m: free budget override in millions. If None, uses API bank.
-        transfers_wanted: how many transfers to attempt (greedy)
-        top_candidates: how many buy candidates to consider per position
-
-    Returns:
-        List of dict rows: priority, sell, buy, score_gain, budget_after, reason
+    Important: we allow sequences where an early downgrade frees budget for later
+    upgrades (e.g., selling a premium to fund two strong moves).
     """
-    gw = resolve_gameweek(int(manager_id), int(gameweek))
-    data = load_entry_picks(int(manager_id), int(gw))
-    picks = data.get("picks", []) or []
-    entry_hist = data.get("entry_history", {}) or {}
 
-    players_idx = players_df.set_index("id", drop=False)
-    team_short = _team_short_map(teams_df)
+    num_transfers = max(1, int(num_transfers))
+    top_plans = max(1, int(top_plans))
 
-    # Current cash
-    bank_10 = int(entry_hist.get("bank", 0) or 0)
+    picks = load_entry_picks(int(manager_id), int(gameweek))
+    squad_ids = [p["element"] for p in picks.get("picks", [])]
+    bank_tenths = int(picks.get("entry_history", {}).get("bank", 0) or 0)
+    bank_m = bank_tenths / 10.0
     if bank_override_m is not None:
-        bank_10 = max(0, int(round(float(bank_override_m) * 10)))
+        bank_m = float(bank_override_m)
 
-    # Squad + sell prices
-    squad_ids = [int(p.get("element")) for p in picks if p.get("element") is not None]
-    sell_prices_10: Dict[int, int] = {}
-    for p in picks:
-        pid = int(p.get("element"))
-        sp = p.get("selling_price")
-        if sp is None or pd.isna(sp):
-            if pid in players_idx.index:
-                sp = players_idx.loc[pid].get("now_cost")
-        sell_prices_10[pid] = int(_to_float(sp, 0))
+    scored = _score_players(players_df, teams_df, fixtures_df, current_gw=int(gameweek), fixtures_ahead=int(fixtures_ahead))
+    scored = scored[scored["is_available"]].copy()
 
-    start_gw = int(gw) + 1
-    fixtures_ahead = int(max(1, fixtures_ahead))
+    squad = scored[scored["id"].isin(squad_ids)].copy()
+    pool = scored[~scored["id"].isin(squad_ids)].copy()
+    if squad.empty or pool.empty:
+        return []
 
-    # Precompute score/FDR for all players once
-    all_players = players_df.copy()
-    all_players["team_id"] = pd.to_numeric(all_players["team"], errors="coerce").fillna(0).astype(int)
-    all_players["fdr"] = all_players["team_id"].apply(lambda t: compute_fdr_for_team(int(t), fixtures_df, start_gw, fixtures_ahead))
-    all_players["score"] = all_players.apply(lambda r: player_score(r, float(r.get("fdr", 3.0))), axis=1)
-    all_players["price_10"] = pd.to_numeric(all_players["now_cost"], errors="coerce").fillna(0).astype(int)
+    # Build a strong buy pool per position (otherwise it tends to stick to cheap fillers)
+    pool = pool[pool["element_type"].notna() & pool["now_cost"].notna()].copy()
+    pool["now_cost_t"] = pool["now_cost"].apply(lambda x: int(round(_safe_float(x, 0.0))))
+    pool_by_pos: Dict[int, pd.DataFrame] = {}
+    for pos in [1, 2, 3, 4]:
+        pos_df = pool[pool["element_type"].astype(int) == pos].sort_values("score", ascending=False)
+        pool_by_pos[pos] = pos_df.head(int(buy_pool_per_pos)).copy()
 
-    # Available buys: exclude unavailable status
-    all_players["status_s"] = all_players["status"].astype(str).str.lower().str.strip()
-    buy_pool = all_players[all_players["status_s"] == "a"].copy()
+    squad = squad[squad["element_type"].notna() & squad["now_cost"].notna()].copy()
+    squad["now_cost_t"] = squad["now_cost"].apply(lambda x: int(round(_safe_float(x, 0.0))))
 
-    # Team counts (max 3)
-    team_counts = _team_counts(squad_ids, players_idx)
+    # Candidate sell list: include both (a) worst scores and (b) highest prices
+    worst = squad.sort_values("score", ascending=True).head(8)
+    expensive = squad.sort_values("now_cost_t", ascending=False).head(6)
+    sell_candidates = pd.concat([worst, expensive]).drop_duplicates(subset=["id"])
 
-    # Map owned for fast exclusion
-    owned = set(squad_ids)
+    # Beam search state
+    # state = (total_gain, bank_tenths, squad_ids_set, team_counts, moves_list)
+    start_bank_t = int(round(bank_m * 10))
+    start_team_counts = _team_counts_from_ids(scored, squad_ids)
+    states = [(0.0, start_bank_t, set(squad_ids), start_team_counts, [])]
 
-    chosen_moves: List[Dict] = []
-    sold_ids: set = set()
-    bought_ids: set = set()
+    def _team_ok(team_counts: Dict[int, int], buy_team: int) -> bool:
+        return team_counts.get(buy_team, 0) + 1 <= 3
 
-    def _sell_rows() -> pd.DataFrame:
-        rows = []
-        for pid in squad_ids:
-            if pid in sold_ids:
+    for step in range(num_transfers):
+        next_states = []
+        for total_gain, bank_t, cur_ids, team_counts, moves in states:
+            cur_squad = scored[scored["id"].isin(list(cur_ids))].copy()
+            if cur_squad.empty:
                 continue
-            if pid not in players_idx.index:
-                continue
-            pr = players_idx.loc[pid]
-            team_id = int(_to_float(pr.get("team"), 0))
-            fdr = compute_fdr_for_team(team_id, fixtures_df, start_gw, fixtures_ahead)
-            sc = player_score(pr, fdr)
-            status = str(pr.get("status", ""))
-            pos = int(_to_float(pr.get("element_type"), 0))
-            rows.append(
-                {
-                    "id": pid,
-                    "pos": pos,
-                    "team": team_id,
-                    "status": status,
-                    "score": sc,
-                    "sell_10": sell_prices_10.get(pid, int(_to_float(pr.get("now_cost"), 0))),
-                }
-            )
-        if not rows:
-            return pd.DataFrame(columns=["id", "pos", "team", "status", "score", "sell_10"])
-        df = pd.DataFrame(rows)
-        df["risk"] = (df["status"].astype(str).str.lower().str.strip() != "a").astype(int)
-        return df.sort_values(["risk", "score"], ascending=[False, True]).drop(columns=["risk"]).reset_index(drop=True)
 
-    def _team_name(team_id: int) -> str:
-        return team_short.get(int(team_id), str(team_id))
+            # Recompute sell candidates within current state
+            cur_squad = cur_squad[cur_squad["element_type"].notna() & cur_squad["now_cost"].notna()].copy()
+            cur_squad["now_cost_t"] = cur_squad["now_cost"].apply(lambda x: int(round(_safe_float(x, 0.0))))
+            worst_s = cur_squad.sort_values("score", ascending=True).head(8)
+            expensive_s = cur_squad.sort_values("now_cost_t", ascending=False).head(6)
+            sells = pd.concat([worst_s, expensive_s]).drop_duplicates(subset=["id"]).to_dict("records")
 
-    def _player_label(pid: int) -> str:
-        if pid not in players_idx.index:
-            return str(pid)
-        r = players_idx.loc[pid]
-        t = int(_to_float(r.get("team"), 0))
-        return f"{_name(r)} ({_team_name(t)})"
+            for sell in sells:
+                sell_id = int(sell["id"])
+                sell_team = int(sell["team"]) if pd.notna(sell.get("team")) else -1
+                sell_pos = int(sell["element_type"])
+                sell_cost_t = int(sell.get("now_cost_t") or 0)
 
-    # Greedy: pick best improvement each step
-    for _ in range(max(1, int(transfers_wanted))):
-        sell_df = _sell_rows()
-        if sell_df.empty:
+                # After selling, you free up sell_cost_t in budget terms
+                max_buy_cost_t = bank_t + sell_cost_t
+
+                counts_after_sell = dict(team_counts)
+                counts_after_sell[sell_team] = max(0, counts_after_sell.get(sell_team, 0) - 1)
+
+                candidates = pool_by_pos.get(sell_pos)
+                if candidates is None or candidates.empty:
+                    continue
+
+                # Filter by budget and not already in squad
+                cand = candidates[(candidates["now_cost_t"] <= max_buy_cost_t) & (~candidates["id"].isin(cur_ids))].copy()
+                if cand.empty:
+                    continue
+
+                # Team limit
+                def _ok_row(r) -> bool:
+                    t = int(r["team"]) if pd.notna(r.get("team")) else -1
+                    return _team_ok(counts_after_sell, t)
+
+                cand = cand[cand.apply(_ok_row, axis=1)]
+                if cand.empty:
+                    continue
+
+                # Take top few buys for branching
+                cand = cand.sort_values("score", ascending=False).head(8)
+                for _, buy in cand.iterrows():
+                    buy_id = int(buy["id"])
+                    buy_team = int(buy["team"]) if pd.notna(buy.get("team")) else -1
+                    buy_cost_t = int(buy["now_cost_t"])
+
+                    new_bank_t = bank_t + sell_cost_t - buy_cost_t
+                    score_gain = float(_safe_float(buy.get("score")) - _safe_float(sell.get("score")))
+                    if score_gain <= 0:
+                        continue
+
+                    # Update team counts
+                    new_counts = dict(counts_after_sell)
+                    new_counts[buy_team] = new_counts.get(buy_team, 0) + 1
+
+                    new_ids = set(cur_ids)
+                    new_ids.remove(sell_id)
+                    new_ids.add(buy_id)
+
+                    delta_m = (buy_cost_t - sell_cost_t) / 10.0
+                    pr, reason = _priority(pd.Series(sell), buy, score_gain, delta_m)
+                    move = {
+                        "Step": step + 1,
+                        "Priority": pr,
+                        "Sell": _player_display_name(pd.Series(sell)),
+                        "Buy": _player_display_name(buy),
+                        "Score gain": round(score_gain, 3),
+                        "Delta (m)": round(delta_m, 1),
+                        "Budget after (m)": round(new_bank_t / 10.0, 1),
+                        "Reason": reason,
+                    }
+
+                    next_states.append((total_gain + score_gain, new_bank_t, new_ids, new_counts, moves + [move]))
+
+        # Prune beam
+        next_states.sort(key=lambda x: x[0], reverse=True)
+        states = next_states[: max(5, int(beam_width))]
+        if not states:
             break
 
-        best = None
+    if not states:
+        return []
 
-        for _, srow in sell_df.iterrows():
-            sell_id = int(srow["id"])
-            pos = int(srow["pos"])
-            sell_team = int(srow["team"])
-            sell_status = str(srow["status"])
-            sell_score = float(srow["score"])
-            sell_10 = int(srow["sell_10"])
+    # Build top plans (unique by move signature)
+    seen = set()
+    plans: List[pd.DataFrame] = []
+    for total_gain, _bank_t, _ids, _counts, moves in sorted(states, key=lambda x: x[0], reverse=True):
+        sig = tuple((m["Sell"], m["Buy"]) for m in moves)
+        if not moves or sig in seen:
+            continue
+        seen.add(sig)
 
-            available_10 = bank_10 + sell_10
-
-            # Predict team cap after selling
-            team_counts_after_sell = dict(team_counts)
-            team_counts_after_sell[sell_team] = max(0, team_counts_after_sell.get(sell_team, 0) - 1)
-
-            candidates = buy_pool[buy_pool["element_type"].astype(int) == pos]
-            # Basic pruning
-            candidates = candidates[~candidates["id"].isin(owned)]
-            candidates = candidates[~candidates["id"].isin(bought_ids)]
-            candidates = candidates[candidates["price_10"] <= available_10]
-
-            # Team cap pruning
-            def _ok_team(team_id: int) -> bool:
-                return team_counts_after_sell.get(int(team_id), 0) < 3
-
-            candidates = candidates[candidates["team_id"].apply(_ok_team)]
-
-            if candidates.empty:
-                continue
-
-            candidates = candidates.sort_values(["score", "total_points"], ascending=[False, False]).head(int(top_candidates))
-
-            # Best candidate for this sell
-            crow = candidates.iloc[0]
-            buy_id = int(crow["id"])
-            buy_score = float(crow["score"])
-            buy_10 = int(crow["price_10"])
-
-            gain = buy_score - sell_score
-            if gain <= 0:
-                continue
-
-            budget_after_10 = bank_10 + sell_10 - buy_10
-
-            # pick best move overall
-            if (best is None) or (gain > best["score_gain"]):
-                best = {
-                    "sell_id": sell_id,
-                    "buy_id": buy_id,
-                    "sell": _player_label(sell_id),
-                    "buy": f"{_name(crow)} ({_team_name(int(crow['team_id']))})",
-                    "score_gain": round(float(gain), 3),
-                    "delta_price_m": round((buy_10 - sell_10) / 10.0, 2),
-                    "budget_after_m": round(budget_after_10 / 10.0, 2),
-                    "priority": _priority(sell_status, float(gain)),
-                    "reason": "" if str(sell_status).lower().strip() == "a" else "Replace flagged player",
-                }
-
-        if best is None:
+        df = pd.DataFrame(moves)
+        df.attrs["total_gain"] = total_gain
+        # Put total gain in a visible column header-like way
+        df.insert(0, "Total gain", [round(total_gain, 3)] + [""] * (len(df) - 1))
+        plans.append(df)
+        if len(plans) >= top_plans:
             break
 
-        # Apply chosen transfer
-        sell_id = int(best["sell_id"])
-        buy_id = int(best["buy_id"])
-
-        # update state
-        sold_ids.add(sell_id)
-        bought_ids.add(buy_id)
-        owned.discard(sell_id)
-        owned.add(buy_id)
-
-        # Update budget
-        bank_10 = int(round(best["budget_after_m"] * 10))
-
-        # Update team counts
-        if sell_id in players_idx.index:
-            sell_team = int(_to_float(players_idx.loc[sell_id].get("team"), 0))
-            team_counts[sell_team] = max(0, team_counts.get(sell_team, 0) - 1)
-        buy_team = int(_to_float(all_players.set_index('id').loc[buy_id].get("team"), 0))
-        team_counts[buy_team] = team_counts.get(buy_team, 0) + 1
-
-        # Better reason if it is a clear fixtures upgrade
-        if not best["reason"]:
-            best["reason"] = "Upgrade score (form/EP/FDR)"
-
-        chosen_moves.append(
-            {
-                "Priority": best["priority"],
-                "Sell": best["sell"],
-                "Buy": best["buy"],
-                "Score gain": best["score_gain"],
-                "Delta price (m)": best["delta_price_m"],
-                "Budget after (m)": best["budget_after_m"],
-                "Reason": best["reason"],
-            }
-        )
-
-    # Priority first, then gain
-    chosen_moves.sort(key=lambda d: (d["Priority"], -float(d["Score gain"])))
-    return chosen_moves
+    return plans
 
 
-# Backwards compatible placeholder
+def build_wildcard_team(
+    manager_id: int,
+    gameweek: int,
+    players_df: pd.DataFrame,
+    teams_df: pd.DataFrame,
+    fixtures_df: pd.DataFrame,
+    budget_m: float = 100.0,
+    weeks_ahead: int = 5,
+) -> pd.DataFrame:
+    """Build a simple 15-player wildcard squad (greedy)."""
+    scored = _score_players(players_df, teams_df, fixtures_df, current_gw=int(gameweek), fixtures_ahead=int(weeks_ahead))
+    scored = scored[scored["is_available"]].copy()
 
-def generate_transfer_suggestions(*args, **kwargs) -> pd.DataFrame:
-    """Deprecated in current UI; kept for compatibility."""
-    return pd.DataFrame()
+    budget_t = int(round(float(budget_m) * 10))
+    need = {1: 2, 2: 5, 3: 5, 4: 3}
+
+    picked_ids: List[int] = []
+    team_counts: Dict[int, int] = {}
+    spent_t = 0
+
+    scored = scored.sort_values(["score", "total_points"], ascending=[False, False])
+    picked_pos_counts = {1: 0, 2: 0, 3: 0, 4: 0}
+
+    def _try_pick(row) -> bool:
+        nonlocal spent_t
+        pid = int(row["id"])
+        pos = int(row["element_type"])
+        team = int(row["team"]) if pd.notna(row.get("team")) else -1
+        cost_t = int(round(_safe_float(row.get("now_cost"), 0.0)))
+        if pid in picked_ids:
+            return False
+        if picked_pos_counts.get(pos, 0) >= need.get(pos, 0):
+            return False
+        if team_counts.get(team, 0) >= 3:
+            return False
+        if spent_t + cost_t > budget_t:
+            return False
+        picked_ids.append(pid)
+        team_counts[team] = team_counts.get(team, 0) + 1
+        picked_pos_counts[pos] = picked_pos_counts.get(pos, 0) + 1
+        spent_t += cost_t
+        return True
+
+    for _, row in scored.iterrows():
+        _try_pick(row)
+        if all(picked_pos_counts[p] >= need[p] for p in need):
+            break
+
+    if not all(picked_pos_counts[p] >= need[p] for p in need):
+        cheap = scored.sort_values(["price"], ascending=True)
+        for _, row in cheap.iterrows():
+            _try_pick(row)
+            if all(picked_pos_counts[p] >= need[p] for p in need):
+                break
+
+    squad = scored[scored["id"].isin(picked_ids)].copy()
+    cols = ["name", "team_short", "position", "price", "total_points", "fdr", "upcoming", "score"]
+    cols = [c for c in cols if c in squad.columns]
+    squad = squad.sort_values(["position", "score"], ascending=[True, False])[cols].reset_index(drop=True)
+    squad.attrs["budget_spent_m"] = spent_t / 10.0
+    squad.attrs["budget_left_m"] = (budget_t - spent_t) / 10.0
+    return squad
 
 
-def build_wildcard_team(*args, **kwargs) -> pd.DataFrame:
-    """Simple placeholder; not used in the current UI."""
-    return pd.DataFrame()
+def suggest_chip_play(
+    manager_id: int,
+    gameweek: int,
+    players_df: pd.DataFrame,
+    teams_df: pd.DataFrame,
+    fixtures_df: pd.DataFrame,
+) -> Optional[str]:
+    """Light chip suggestion based on double/blank gameweek signals."""
+    next_gw = int(gameweek) + 1
+    f = fixtures_df.copy()
+    f = f[f["event"].notna()]
+    f_next = f[f["event"] == next_gw]
+    if f_next.empty:
+        return None
 
+    counts = pd.concat([f_next["team_h"], f_next["team_a"]]).value_counts()
+    if (counts >= 2).any():
+        return "Bench Boost"
 
-def suggest_chip_play(*args, **kwargs) -> Optional[str]:
-    """Chip suggestion is out of scope here; return None."""
+    teams_with_fixture = set(counts.index.astype(int).tolist())
+    all_teams = set(teams_df["id"].dropna().astype(int).tolist())
+    blank_teams = all_teams - teams_with_fixture
+    if len(blank_teams) >= 6:
+        return "Free Hit"
+
     return None
