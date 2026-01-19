@@ -48,121 +48,6 @@ def _get_json(path: str, timeout: int = 20, retries: int = 3) -> dict:
 
     raise FPLError(f"FPL request failed: {url} ({type(last_exc).__name__}: {last_exc})")
 
-
-# -------------------------
-# Per-player history (minutes)
-# -------------------------
-
-
-@lru_cache(maxsize=5000)
-def load_element_summary(player_id: int) -> dict:
-    """Public element summary.
-
-    Contains match-by-match history including minutes.
-    """
-    return _get_json(f"/element-summary/{int(player_id)}/")
-
-
-def recent_minutes(player_id: int, last_matches: int = 3) -> Tuple[int, int]:
-    """Return (minutes_sum, matches_count) over the last N played matches."""
-    n = max(0, int(last_matches))
-    if n == 0:
-        return 0, 0
-
-    data = load_element_summary(int(player_id))
-    hist = data.get("history", []) or []
-    if not hist:
-        return 0, 0
-
-    mins: List[int] = []
-    for row in reversed(hist):
-        m = row.get("minutes", 0) or 0
-        mins.append(int(m))
-        if len(mins) >= n:
-            break
-
-    return int(sum(mins)), int(len(mins))
-
-
-def _minutes_stats_for_ids(player_ids: Sequence[int], last_matches: int) -> Dict[int, Dict[str, float]]:
-    """Fetch minutes stats for a set of ids.
-
-    Returns dict: id -> {minutes_last_n, minutes_games, minutes_ratio, avg_minutes}
-    """
-    out: Dict[int, Dict[str, float]] = {}
-    n = max(0, int(last_matches))
-    if n == 0:
-        return out
-
-    for pid in set(int(x) for x in player_ids if x is not None):
-        try:
-            s, k = recent_minutes(pid, last_matches=n)
-        except Exception:
-            # If history fetch fails (rate limit etc.), don't punish.
-            s, k = 0, 0
-
-        denom = 90 * k if k else 0
-        ratio = (float(s) / float(denom)) if denom else 1.0
-        ratio = max(0.0, min(1.0, ratio))
-        avg = (float(s) / float(k)) if k else 90.0
-        out[pid] = {
-            "minutes_last_n": float(s),
-            "minutes_games": float(k),
-            "minutes_ratio": float(ratio),
-            "avg_minutes": float(avg),
-        }
-    return out
-
-
-def apply_minutes_penalty(
-    df: pd.DataFrame,
-    player_ids: Sequence[int],
-    last_matches: int,
-    weight: float = 0.7,
-) -> pd.DataFrame:
-    """Apply a minutes-based penalty to df["score"] for the given ids.
-
-    score *= ((1 - w) + w * minutes_ratio)
-    where minutes_ratio is based on the last N played matches.
-    """
-    if df is None or df.empty:
-        return df
-
-    n = max(0, int(last_matches))
-    if n == 0:
-        return df
-
-    w = max(0.0, min(1.0, float(weight)))
-    stats = _minutes_stats_for_ids(player_ids, last_matches=n)
-    if not stats:
-        return df
-
-    out_df = df.copy()
-    out_df["minutes_last_n"] = out_df.get("minutes_last_n", pd.NA)
-    out_df["avg_minutes"] = out_df.get("avg_minutes", pd.NA)
-    out_df["minutes_ratio"] = out_df.get("minutes_ratio", pd.NA)
-
-    id_set = set(int(x) for x in player_ids)
-    for idx, r in out_df.iterrows():
-        try:
-            pid = int(r.get("id"))
-        except Exception:
-            continue
-        if pid not in id_set:
-            continue
-        st = stats.get(pid)
-        if not st:
-            continue
-
-        ratio = float(st["minutes_ratio"])
-        factor = (1.0 - w) + (w * ratio)
-        out_df.at[idx, "score"] = float(_safe_float(r.get("score"), 0.0)) * float(factor)
-        out_df.at[idx, "minutes_last_n"] = float(st["minutes_last_n"])
-        out_df.at[idx, "avg_minutes"] = float(st["avg_minutes"])
-        out_df.at[idx, "minutes_ratio"] = float(st["minutes_ratio"])
-
-    return out_df
-
 # -------------------------
 # Bootstrap + fixtures
 # -------------------------
@@ -457,9 +342,6 @@ def show_current_team(
     teams_df: pd.DataFrame,
     fixtures_df: pd.DataFrame,
     fixtures_ahead: int = 5,
-    minutes_lookback: int = 0,
-    minutes_weight: float = 0.7,
-    **_: object,
 ) -> pd.DataFrame:
     picks = load_entry_picks(int(manager_id), int(gameweek))
     element_ids = [p["element"] for p in picks.get("picks", [])]
@@ -467,31 +349,11 @@ def show_current_team(
     scored = _score_players(players_df, teams_df, fixtures_df, current_gw=int(gameweek), fixtures_ahead=int(fixtures_ahead))
     squad = scored[scored["id"].isin(element_ids)].copy()
 
-    # Minutes penalty only for the squad (fast, avoids huge API fan-out)
-    if int(minutes_lookback) > 0 and not squad.empty:
-        squad = apply_minutes_penalty(
-            squad,
-            player_ids=squad["id"].astype(int).tolist(),
-            last_matches=int(minutes_lookback),
-            weight=float(minutes_weight),
-        )
-
     order = {eid: i for i, eid in enumerate(element_ids)}
     squad["_order"] = squad["id"].map(order)
     squad = squad.sort_values("_order").drop(columns=["_order"])
 
-    cols = [
-        "name",
-        "team_short",
-        "position",
-        "price",
-        "total_points",
-        "fdr",
-        "minutes_last_n",
-        "avg_minutes",
-        "availability_reason",
-        "score",
-    ]
+    cols = ["name", "team_short", "position", "price", "total_points", "fdr", "availability_reason", "score"]
     cols = [c for c in cols if c in squad.columns]
     return squad[cols].reset_index(drop=True)
 
@@ -504,9 +366,6 @@ def generate_transfer_suggestions(
     fixtures_df: pd.DataFrame,
     top_n: int = 10,
     fixtures_ahead: int = 5,
-    minutes_lookback: int = 0,
-    minutes_weight: float = 0.7,
-    **_: object,
 ) -> pd.DataFrame:
     picks = load_entry_picks(int(manager_id), int(gameweek))
     element_ids = {p["element"] for p in picks.get("picks", [])}
@@ -515,19 +374,7 @@ def generate_transfer_suggestions(
     targets = scored[~scored["id"].isin(element_ids)].copy()
     targets = targets[targets["is_available"]]
 
-    # Apply minutes penalty on a limited shortlist (keeps API calls low)
-    if int(minutes_lookback) > 0 and not targets.empty:
-        shortlist_n = max(int(top_n) * 8, 60)
-        shortlist = targets.sort_values("score", ascending=False).head(shortlist_n).copy()
-        shortlist = apply_minutes_penalty(
-            shortlist,
-            player_ids=shortlist["id"].astype(int).tolist(),
-            last_matches=int(minutes_lookback),
-            weight=float(minutes_weight),
-        )
-        targets = shortlist
-
-    cols = ["name", "team_short", "position", "price", "total_points", "fdr", "minutes_last_n", "avg_minutes", "score"]
+    cols = ["name", "team_short", "position", "price", "total_points", "fdr", "score"]
     cols = [c for c in cols if c in targets.columns]
 
     return targets.sort_values("score", ascending=False).head(int(top_n))[cols].reset_index(drop=True)
@@ -583,9 +430,6 @@ def suggest_transfer_plans(
     free_budget_m: Optional[float] = None,
     top_plans: int = 3,
     beam_width: int = 30,
-    minutes_lookback: int = 0,
-    minutes_weight: float = 0.7,
-    **_: object,
 ) -> pd.DataFrame:
     """Return top multi-transfer plans.
 
@@ -606,29 +450,6 @@ def suggest_transfer_plans(
     squad = scored[scored["id"].isin(squad_ids)].copy()
     pool = scored[~scored["id"].isin(squad_ids)].copy()
     pool = pool[pool["is_available"]]
-
-    # Minutes penalty: apply to squad + a capped pool shortlist (keeps API calls low)
-    if int(minutes_lookback) > 0:
-        if not squad.empty:
-            squad = apply_minutes_penalty(
-                squad,
-                player_ids=squad["id"].astype(int).tolist(),
-                last_matches=int(minutes_lookback),
-                weight=float(minutes_weight),
-            )
-        if not pool.empty:
-            pool_parts = []
-            for pos in [1, 2, 3, 4]:
-                part = pool[pool["element_type"].astype(int) == pos].sort_values("score", ascending=False).head(120).copy()
-                if not part.empty:
-                    part = apply_minutes_penalty(
-                        part,
-                        player_ids=part["id"].astype(int).tolist(),
-                        last_matches=int(minutes_lookback),
-                        weight=float(minutes_weight),
-                    )
-                pool_parts.append(part)
-            pool = pd.concat(pool_parts, ignore_index=True) if pool_parts else pool
 
     if squad.empty or pool.empty:
         return pd.DataFrame(columns=[

@@ -30,8 +30,6 @@ st.title("FPL Coach")
 with st.sidebar:
     st.header("Inputs")
 
-    page = st.selectbox("Page", ["Home", "Coach"], index=1)
-
     manager_name = st.selectbox("Manager", list(MANAGERS.keys()), index=1)
     default_mid = MANAGERS.get(manager_name) or 1548623
     manager_id = st.number_input("Manager ID", min_value=1, value=int(default_mid))
@@ -41,9 +39,6 @@ with st.sidebar:
 
     fixtures_ahead = st.slider("Aantal upcoming fixtures voor FDR", min_value=1, max_value=10, value=5)
 
-    minutes_lookback = st.slider("Minutes lookback (laatste wedstrijden)", min_value=0, max_value=5, value=2)
-    minutes_weight = st.slider("Minutes impact (0=uit, 1=hard)", min_value=0.0, max_value=1.0, value=0.7, step=0.05)
-
     num_transfers = st.slider("Aantal transfers", min_value=1, max_value=5, value=2)
 
     use_bank_override = st.checkbox("Vrij budget override gebruiken", value=False)
@@ -52,37 +47,6 @@ with st.sidebar:
         bank_override_m = st.number_input("Vrij budget (m)", min_value=0.0, max_value=50.0, value=0.0, step=0.1)
 
     top_plans = st.slider("Aantal plannen tonen", min_value=1, max_value=5, value=3)
-
-
-if page == "Home":
-    st.subheader("Wat is dit?")
-    st.markdown(
-        """
-FPL Coach gebruikt alleen publieke Fantasy Premier League data.
-
-**Kernfeatures**
-- Team laden op basis van Manager ID
-- FDR op basis van de **volgende N fixtures** (start vanaf **GW+1**)
-- Transfer targets en multi-transfer plannen (premium verkoop kan upgrades financieren)
-- Minutes-factor: spelers met weinig minuten in de laatste wedstrijden zakken in ranking
-
-**Belangrijk**
-- Verkoopprijs is een benadering (publieke data = huidige prijs).
-        """
-    )
-
-    st.subheader("Patch notes")
-    st.markdown(
-        """
-- Nieuw: Homepagina
-- Nieuw: Minutes impact (laatste wedstrijden)
-- Verbeterd: FDR op basis van komende fixtures (GW+1)
-- Verbeterd: Multi-transfer planning + P1/P2/P3 prioriteit
-- Nieuw: Vrij budget override + aantal transfers instelbaar
-- Fix: Gameweek fallback als picks voor gekozen GW nog niet beschikbaar zijn
-        """
-    )
-    st.stop()
 
 
 # ----- Data loading -----
@@ -115,16 +79,7 @@ col_left, col_right = st.columns([1, 1])
 with col_left:
     st.subheader("Huidige team")
     try:
-        squad_df = show_current_team(
-            int(manager_id),
-            int(gw),
-            players_df,
-            teams_df,
-            fixtures_df,
-            fixtures_ahead=int(fixtures_ahead),
-            minutes_lookback=int(minutes_lookback),
-            minutes_weight=float(minutes_weight),
-        )
+        squad_df = show_current_team(int(manager_id), int(gw), players_df, teams_df, fixtures_df, fixtures_ahead=int(fixtures_ahead))
         st.dataframe(squad_df, use_container_width=True)
     except Exception as e:
         st.error(f"Kon team niet laden. Details: {type(e).__name__}: {e}")
@@ -140,8 +95,6 @@ with col_right:
             fixtures_df,
             fixtures_ahead=int(fixtures_ahead),
             top_n=10,
-            minutes_lookback=int(minutes_lookback),
-            minutes_weight=float(minutes_weight),
         )
         st.dataframe(targets_df, use_container_width=True)
     except Exception as e:
@@ -162,8 +115,6 @@ try:
         num_transfers=int(num_transfers),
         free_budget_m=bank_override_m,
         top_plans=int(top_plans),
-        minutes_lookback=int(minutes_lookback),
-        minutes_weight=float(minutes_weight),
     )
 
     if plans_df is None or plans_df.empty:
