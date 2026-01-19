@@ -41,9 +41,7 @@ with st.sidebar:
 
     fixtures_ahead = st.slider("Aantal upcoming fixtures voor FDR", min_value=1, max_value=10, value=5)
 
-    st.divider()
-    st.subheader("Minutes factor")
-    minutes_lookback = st.slider("Laatste wedstrijden (minutes)", min_value=0, max_value=5, value=2)
+    minutes_lookback = st.slider("Minutes lookback (laatste wedstrijden)", min_value=0, max_value=5, value=2)
     minutes_weight = st.slider("Minutes impact (0=uit, 1=hard)", min_value=0.0, max_value=1.0, value=0.7, step=0.05)
 
     num_transfers = st.slider("Aantal transfers", min_value=1, max_value=5, value=2)
@@ -56,34 +54,33 @@ with st.sidebar:
     top_plans = st.slider("Aantal plannen tonen", min_value=1, max_value=5, value=3)
 
 
-# ----- Home page -----
 if page == "Home":
-    st.subheader("Wat doet dit?")
+    st.subheader("Wat is dit?")
     st.markdown(
         """
-**FPL Coach** helpt je met:
-- Je huidige team tonen (incl. FDR en availability)
-- Top targets buiten je squad
-- Multi-transfer plannen (verkoop van premium kan upgrades financieren)
+FPL Coach gebruikt alleen publieke Fantasy Premier League data.
 
-**Belangrijke keuzes:**
-- *FDR*: kijkt naar de volgende **N fixtures**, start vanaf **GW+1** (current GW wordt overgeslagen)
-- *Minutes factor*: verlaagt de score van spelers met weinig minuten in de laatste wedstrijden
+**Kernfeatures**
+- Team laden op basis van Manager ID
+- FDR op basis van de **volgende N fixtures** (start vanaf **GW+1**)
+- Transfer targets en multi-transfer plannen (premium verkoop kan upgrades financieren)
+- Minutes-factor: spelers met weinig minuten in de laatste wedstrijden zakken in ranking
 
----
+**Belangrijk**
+- Verkoopprijs is een benadering (publieke data = huidige prijs).
+        """
+    )
 
-### Patch notes (eindgebruikers)
-**Nieuw / verbeterd**
-- Homepagina met uitleg en patch notes
-- FDR op basis van **aantal fixtures** (niet alleen gameweeks) en start vanaf **GW+1**
-- Minutes factor: neem **gespeelde minuten** van de laatste wedstrijden mee (bijv. speler met 50/180 min zakt in ranking)
-- Multi-transfer plannen: verkoop van duurdere speler kan later extra upgrades mogelijk maken
-- Manager presets + Custom ID
-- Gameweek fallback als picks voor de gekozen GW nog niet beschikbaar zijn
-
-**Bekende beperking**
-- Verkoopprijs is een benadering (publieke data = huidige prijs). Exacte sell-price kan afwijken zonder login.
-"""
+    st.subheader("Patch notes")
+    st.markdown(
+        """
+- Nieuw: Homepagina
+- Nieuw: Minutes impact (laatste wedstrijden)
+- Verbeterd: FDR op basis van komende fixtures (GW+1)
+- Verbeterd: Multi-transfer planning + P1/P2/P3 prioriteit
+- Nieuw: Vrij budget override + aantal transfers instelbaar
+- Fix: Gameweek fallback als picks voor gekozen GW nog niet beschikbaar zijn
+        """
     )
     st.stop()
 
@@ -164,9 +161,9 @@ try:
         fixtures_ahead=int(fixtures_ahead),
         num_transfers=int(num_transfers),
         free_budget_m=bank_override_m,
+        top_plans=int(top_plans),
         minutes_lookback=int(minutes_lookback),
         minutes_weight=float(minutes_weight),
-        top_plans=int(top_plans),
     )
 
     if plans_df is None or plans_df.empty:
