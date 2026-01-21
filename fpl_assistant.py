@@ -1,18 +1,25 @@
 """FPL helper module (public API only).
 
+Features
 - FDR uses the next N fixtures starting from (current_gw + 1).
+- Optional recent-minutes penalty using /element-summary/{player_id}/ (last N matches).
+- Multi-transfer planning is sequential: selling a premium can fund later upgrades.
+
+Notes
 - Sell price is approximated using current price (now_cost).
+- This module is safe to import (no Streamlit code).
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
 from functools import lru_cache
-from typing import Dict, List, Optional, Sequence, Tuple
+from typing import Dict, List, Optional, Tuple
+
+import time
 
 import pandas as pd
 import requests
-import time
 
 BASE_URL = "https://fantasy.premierleague.com/api"
 
@@ -33,7 +40,6 @@ def _get_json(path: str, timeout: int = 20, retries: int = 3) -> dict:
         try:
             r = requests.get(url, timeout=timeout, headers={"User-Agent": "fpl-streamlit"})
             if r.status_code == 429:
-                # Rate limited; wait a bit and retry.
                 time.sleep(0.8 * (attempt + 1))
                 continue
             if r.status_code == 404:
@@ -48,9 +54,11 @@ def _get_json(path: str, timeout: int = 20, retries: int = 3) -> dict:
 
     raise FPLError(f"FPL request failed: {url} ({type(last_exc).__name__}: {last_exc})")
 
+
 # -------------------------
 # Bootstrap + fixtures
 # -------------------------
+
 
 @lru_cache(maxsize=1)
 def load_bootstrap() -> Tuple[pd.DataFrame, pd.DataFrame]:
@@ -58,7 +66,6 @@ def load_bootstrap() -> Tuple[pd.DataFrame, pd.DataFrame]:
     players_df = pd.DataFrame(data.get("elements", []))
     teams_df = pd.DataFrame(data.get("teams", []))
 
-    # Ensure expected columns exist
     for col in [
         "id",
         "web_name",
@@ -151,6 +158,7 @@ def load_fixtures() -> pd.DataFrame:
 # Entry / picks
 # -------------------------
 
+
 def load_entry_picks(manager_id: int, gameweek: int) -> dict:
     mid = int(manager_id)
     gw = int(gameweek)
@@ -158,17 +166,13 @@ def load_entry_picks(manager_id: int, gameweek: int) -> dict:
 
 
 def resolve_gameweek(manager_id: int, preferred_gameweek: int, max_fallbacks: int = 3) -> int:
-    """Find the newest gameweek where /picks/ works for this manager.
-
-    This avoids crashing when you request a GW that is not available yet.
-    """
+    """Find the newest gameweek where /picks/ works for this manager."""
     gw = int(preferred_gameweek)
     for _ in range(max(0, int(max_fallbacks)) + 1):
         try:
             load_entry_picks(int(manager_id), gw)
             return gw
         except FPLError as e:
-            # Usually 404 if GW not available or entry is private.
             if "404" not in str(e):
                 raise
             gw = max(1, gw - 1)
@@ -178,6 +182,7 @@ def resolve_gameweek(manager_id: int, preferred_gameweek: int, max_fallbacks: in
 # -------------------------
 # Helpers
 # -------------------------
+
 
 def _safe_float(v, default: float = 0.0) -> float:
     try:
@@ -217,8 +222,95 @@ def _team_short_map(teams_df: pd.DataFrame) -> Dict[int, str]:
 
 
 # -------------------------
+# Minutes (recent matches)
+# -------------------------
+
+
+@lru_cache(maxsize=5000)
+def load_element_summary(player_id: int) -> dict:
+    return _get_json(f"/element-summary/{int(player_id)}/", retries=2)
+
+
+def recent_minutes(player_id: int, last_matches: int = 2) -> Tuple[int, int]:
+    """Return (minutes_sum, matches_count) over last N played matches."""
+    try:
+        data = load_element_summary(int(player_id))
+        hist = data.get("history", []) or []
+        if not hist:
+            return 0, 0
+        mins: List[int] = []
+        for row in reversed(hist):
+            mins.append(int(row.get("minutes", 0) or 0))
+            if len(mins) >= int(last_matches):
+                break
+        return sum(mins), len(mins)
+    except Exception:
+        # Unknown -> don't punish
+        return 0, 0
+
+
+def apply_minutes_penalty(
+    scored_df: pd.DataFrame,
+    player_ids: List[int],
+    last_matches: int,
+    weight: float,
+) -> pd.DataFrame:
+    """Apply minutes penalty to a subset of players.
+
+    Adds columns: minutes_last_n, minutes_games, minutes_ratio, avg_minutes.
+    Updates score := score * ((1-w) + w*minutes_ratio).
+
+    If minutes data is missing, minutes_ratio defaults to 1.0 (no penalty).
+    """
+    if scored_df is None or scored_df.empty:
+        return scored_df
+
+    n = max(0, int(last_matches))
+    w = max(0.0, min(1.0, float(weight)))
+    if n == 0 or w == 0.0 or not player_ids:
+        return scored_df
+
+    df = scored_df.copy()
+    pid_set = {int(x) for x in player_ids}
+
+    mins_sum: Dict[int, int] = {}
+    mins_games: Dict[int, int] = {}
+    mins_ratio: Dict[int, float] = {}
+    mins_avg: Dict[int, float] = {}
+
+    for pid in pid_set:
+        s, k = recent_minutes(pid, last_matches=n)
+        mins_sum[pid] = int(s)
+        mins_games[pid] = int(k)
+        denom = 90 * k
+        r = (s / denom) if denom else 1.0
+        r = max(0.0, min(1.0, float(r)))
+        mins_ratio[pid] = r
+        mins_avg[pid] = (s / k) if k else 90.0
+
+    df.loc[df["id"].astype(int).isin(pid_set), "minutes_last_n"] = df["id"].astype(int).map(mins_sum)
+    df.loc[df["id"].astype(int).isin(pid_set), "minutes_games"] = df["id"].astype(int).map(mins_games)
+    df.loc[df["id"].astype(int).isin(pid_set), "minutes_ratio"] = df["id"].astype(int).map(mins_ratio)
+    df.loc[df["id"].astype(int).isin(pid_set), "avg_minutes"] = df["id"].astype(int).map(mins_avg)
+
+    # Default non-touched players
+    df["minutes_last_n"] = df.get("minutes_last_n", pd.Series([pd.NA] * len(df)))
+    df["minutes_games"] = df.get("minutes_games", pd.Series([pd.NA] * len(df)))
+    df["minutes_ratio"] = df.get("minutes_ratio", pd.Series([pd.NA] * len(df)))
+    df["avg_minutes"] = df.get("avg_minutes", pd.Series([pd.NA] * len(df)))
+
+    mask = df["id"].astype(int).isin(pid_set)
+    ratio = df.loc[mask, "minutes_ratio"].astype(float).fillna(1.0)
+    factor = (1.0 - w) + (w * ratio)
+    df.loc[mask, "score"] = df.loc[mask, "score"].astype(float) * factor
+
+    return df
+
+
+# -------------------------
 # FDR (next N fixtures)
 # -------------------------
+
 
 def get_upcoming_fixtures(
     team_id: int,
@@ -246,7 +338,7 @@ def get_upcoming_fixtures(
     for _, row in f.head(n).iterrows():
         is_home = int(row["team_h"]) == t
         opp = int(row["team_a"]) if is_home else int(row["team_h"])
-        diff = int(row["team_h_difficulty"]) if is_home else int(row["team_a_difficulty"])  # 1..5
+        diff = int(row["team_h_difficulty"]) if is_home else int(row["team_a_difficulty"])
         out.append({"gw": int(row["event"]), "opp": opp, "ha": "H" if is_home else "A", "diff": diff})
     return out
 
@@ -268,6 +360,7 @@ def compute_fdr_for_team(
 # Scoring
 # -------------------------
 
+
 def _availability(status: str, chance_next: Optional[float]) -> Tuple[bool, str]:
     s = (status or "").strip().lower()
     chance = _safe_float(chance_next, default=100.0)
@@ -278,15 +371,14 @@ def _availability(status: str, chance_next: Optional[float]) -> Tuple[bool, str]
         return False, "Suspended"
     if s == "u":
         return False, "Unavailable"
-    # doubtful (d) is still allowed but flagged
-    if chance is not None and chance > 0 and chance < 75:
+    if chance is not None and 0 < chance < 75:
         return True, f"Chance {int(chance)}%"
     if s in ["a", "d"]:
         return True, "Available" if s == "a" else "Doubtful"
     return True, "Available"
 
 
-def _score_players(
+def _score_players_base(
     players_df: pd.DataFrame,
     teams_df: pd.DataFrame,
     fixtures_df: pd.DataFrame,
@@ -306,7 +398,6 @@ def _score_players(
     df["position"] = df["element_type"].apply(lambda x: _position_name(int(x)) if pd.notna(x) else "")
     df["price"] = df["now_cost"].apply(lambda x: round(_safe_float(x) / 10.0, 1))
 
-    # FDR + upcoming
     df["fdr"] = df["team"].apply(
         lambda t: compute_fdr_for_team(int(t), fixtures_df, start_gw, fixtures_ahead) if pd.notna(t) else 3.0
     )
@@ -315,15 +406,12 @@ def _score_players(
         lambda t: get_upcoming_fixtures(int(t), fixtures_df, start_gw, fixtures_ahead) if pd.notna(t) else []
     )
 
-    # Base features
     ppg = df["points_per_game"].apply(lambda x: _safe_float(x))
     form = df["form"].apply(lambda x: _safe_float(x))
     epn = df["ep_next"].apply(lambda x: _safe_float(x))
 
-    # Heuristic score: reward ppg/form/ep_next, penalize FDR
     df["score"] = (ppg * 2.0 + form * 0.6 + epn * 0.7) - (df["fdr"] * 0.9)
 
-    # Availability
     avail = df.apply(lambda r: _availability(str(r.get("status") or ""), r.get("chance_of_playing_next_round")), axis=1)
     df["is_available"] = [a[0] for a in avail]
     df["availability_reason"] = [a[1] for a in avail]
@@ -335,6 +423,7 @@ def _score_players(
 # Views / suggestions
 # -------------------------
 
+
 def show_current_team(
     manager_id: int,
     gameweek: int,
@@ -342,6 +431,8 @@ def show_current_team(
     teams_df: pd.DataFrame,
     fixtures_df: pd.DataFrame,
     fixtures_ahead: int = 5,
+    minutes_lookback: int = 0,
+    minutes_weight: float = 0.7,
 ) -> pd.DataFrame:
     picks = load_entry_picks(int(manager_id), int(gameweek))
     element_ids = [p["element"] for p in picks.get("picks", [])]
@@ -349,14 +440,28 @@ def show_current_team(
     scored = _score_players(players_df, teams_df, fixtures_df, current_gw=int(gameweek), fixtures_ahead=int(fixtures_ahead))
     squad = scored[scored["id"].isin(element_ids)].copy()
 
+    # Apply minutes penalty for display/score if requested (only 15 players)
+    if int(minutes_lookback) > 0:
+        squad = apply_minutes_penalty(squad, last_matches=int(minutes_lookback), weight=float(minutes_weight), adjust_score=True)
+
     order = {eid: i for i, eid in enumerate(element_ids)}
     squad["_order"] = squad["id"].map(order)
     squad = squad.sort_values("_order").drop(columns=["_order"])
 
-    cols = ["name", "team_short", "position", "price", "total_points", "fdr", "availability_reason", "score"]
+    cols = [
+        "name",
+        "team_short",
+        "position",
+        "price",
+        "total_points",
+        "fdr",
+        "minutes_last_n",
+        "avg_minutes",
+        "availability_reason",
+        "score",
+    ]
     cols = [c for c in cols if c in squad.columns]
     return squad[cols].reset_index(drop=True)
-
 
 def generate_transfer_suggestions(
     manager_id: int,
@@ -366,6 +471,8 @@ def generate_transfer_suggestions(
     fixtures_df: pd.DataFrame,
     top_n: int = 10,
     fixtures_ahead: int = 5,
+    minutes_lookback: int = 0,
+    minutes_weight: float = 0.7,
 ) -> pd.DataFrame:
     picks = load_entry_picks(int(manager_id), int(gameweek))
     element_ids = {p["element"] for p in picks.get("picks", [])}
@@ -374,15 +481,21 @@ def generate_transfer_suggestions(
     targets = scored[~scored["id"].isin(element_ids)].copy()
     targets = targets[targets["is_available"]]
 
-    cols = ["name", "team_short", "position", "price", "total_points", "fdr", "score"]
+    # Efficiency: apply minutes only to a shortlist, then re-rank
+    if int(minutes_lookback) > 0 and not targets.empty:
+        shortlist = targets.sort_values("score", ascending=False).head(max(50, int(top_n) * 30)).copy()
+        shortlist = apply_minutes_penalty(shortlist, last_matches=int(minutes_lookback), weight=float(minutes_weight), adjust_score=True)
+        targets = shortlist
+
+    cols = ["name", "team_short", "position", "price", "total_points", "fdr", "minutes_last_n", "avg_minutes", "score"]
     cols = [c for c in cols if c in targets.columns]
 
     return targets.sort_values("score", ascending=False).head(int(top_n))[cols].reset_index(drop=True)
 
-
 # -------------------------
 # Multi-transfer planning
 # -------------------------
+
 
 @dataclass(frozen=True)
 class _Move:
@@ -430,6 +543,8 @@ def suggest_transfer_plans(
     free_budget_m: Optional[float] = None,
     top_plans: int = 3,
     beam_width: int = 30,
+    minutes_lookback: int = 0,
+    minutes_weight: float = 0.7,
 ) -> pd.DataFrame:
     """Return top multi-transfer plans.
 
@@ -437,6 +552,9 @@ def suggest_transfer_plans(
 
     free_budget_m:
       - If set, overrides the bank from FPL (value in millions).
+
+    minutes_lookback / minutes_weight:
+      - If enabled, penalizes players who played few minutes in recent matches (helps avoid benched/injured players).
     """
     gw = int(gameweek)
     picks = load_entry_picks(int(manager_id), gw)
@@ -448,10 +566,10 @@ def suggest_transfer_plans(
     scored = _score_players(players_df, teams_df, fixtures_df, current_gw=gw, fixtures_ahead=int(fixtures_ahead))
 
     squad = scored[scored["id"].isin(squad_ids)].copy()
-    pool = scored[~scored["id"].isin(squad_ids)].copy()
-    pool = pool[pool["is_available"]]
+    pool_all = scored[~scored["id"].isin(squad_ids)].copy()
+    pool_all = pool_all[pool_all["is_available"]]
 
-    if squad.empty or pool.empty:
+    if squad.empty or pool_all.empty:
         return pd.DataFrame(columns=[
             "Plan",
             "Step",
@@ -465,6 +583,12 @@ def suggest_transfer_plans(
             "BankAfter(m)",
             "Reason",
         ])
+
+    # Apply minutes penalty efficiently:
+    # - Squad is always small (<=15)
+    # - Pool is limited to a shortlist per position
+    if int(minutes_lookback) > 0:
+        squad = apply_minutes_penalty(squad, last_matches=int(minutes_lookback), weight=float(minutes_weight), adjust_score=True)
 
     # Current team counts
     team_counts: Dict[int, int] = squad["team"].dropna().astype(int).value_counts().to_dict()
@@ -484,11 +608,19 @@ def suggest_transfer_plans(
     sell_candidates_ids = set(squad_sorted_exp["id"].astype(int).tolist() + squad_sorted_low["id"].astype(int).tolist())
     sell_candidates_ids |= set(squad_risky["id"].astype(int).tolist())
 
-    # Preindex rows
+    # Preindex rows (use penalized squad rows)
     squad_by_id = {int(r["id"]): r for _, r in squad.iterrows()}
+
+    # Build pool per position (shortlist for minutes calls)
     pool_by_pos: Dict[int, pd.DataFrame] = {}
+    per_pos_shortlist = 120  # keeps API calls reasonable
     for pos in [1, 2, 3, 4]:
-        pool_by_pos[pos] = pool[pool["element_type"].astype(int) == pos].copy().sort_values("score", ascending=False)
+        pos_df = pool_all[pool_all["element_type"].astype(int) == pos].copy().sort_values("score", ascending=False)
+        pos_df = pos_df.head(per_pos_shortlist).copy()
+        if int(minutes_lookback) > 0 and not pos_df.empty:
+            pos_df = apply_minutes_penalty(pos_df, last_matches=int(minutes_lookback), weight=float(minutes_weight), adjust_score=True)
+            pos_df = pos_df.sort_values("score", ascending=False)
+        pool_by_pos[pos] = pos_df
 
     states: List[_State] = [init]
     steps = max(1, int(num_transfers))
@@ -499,10 +631,8 @@ def suggest_transfer_plans(
         for st in states:
             current_squad_set = set(st.squad_ids)
 
-            # Refresh squad dataframe for this state (only for sells)
             for sell_id in list(current_squad_set):
                 if sell_id not in sell_candidates_ids and len(st.moves) == 0:
-                    # first step: restrict sells for speed
                     continue
 
                 sell_row = squad_by_id.get(int(sell_id))
@@ -513,10 +643,8 @@ def suggest_transfer_plans(
                 sell_pos = int(sell_row.get("element_type")) if pd.notna(sell_row.get("element_type")) else 0
                 sell_cost_t = int(round(_safe_float(sell_row.get("now_cost", 0)) or 0))
 
-                # Bank after sell (sell price approx = current price)
                 bank_after_sell_t = int(st.bank_t + sell_cost_t)
 
-                # team counts after sell
                 counts_after_sell = dict(st.team_counts)
                 if sell_team != -1:
                     counts_after_sell[sell_team] = max(0, counts_after_sell.get(sell_team, 0) - 1)
@@ -525,7 +653,6 @@ def suggest_transfer_plans(
                 if candidates is None or candidates.empty:
                     continue
 
-                # Affordable + team limit + not already in squad
                 def _ok(buy_r: pd.Series) -> bool:
                     buy_id = int(buy_r["id"])
                     if buy_id in current_squad_set:
@@ -538,7 +665,7 @@ def suggest_transfer_plans(
                         return False
                     return True
 
-                cand_ok = candidates[candidates.apply(_ok, axis=1)].head(15)  # branch factor
+                cand_ok = candidates[candidates.apply(_ok, axis=1)].head(20)
                 if cand_ok.empty:
                     continue
 
@@ -551,7 +678,6 @@ def suggest_transfer_plans(
 
                     prio, reason = _priority_for_move(sell_row, gain)
 
-                    # Apply move
                     new_bank_t = bank_after_sell_t - buy_cost_t
                     new_squad_ids = [x for x in st.squad_ids if int(x) != int(sell_id)] + [buy_id]
 
@@ -583,13 +709,11 @@ def suggest_transfer_plans(
                         )
                     )
 
-        # Keep best beam
         new_states.sort(key=lambda s: s.total_gain, reverse=True)
         states = new_states[: max(1, int(beam_width))]
         if not states:
             break
 
-    # Build table
     rows: List[Dict] = []
     states.sort(key=lambda s: s.total_gain, reverse=True)
     for plan_idx, st in enumerate(states[: max(1, int(top_plans))], start=1):
