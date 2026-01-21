@@ -251,19 +251,85 @@ def recent_minutes(player_id: int, last_matches: int = 2) -> Tuple[int, int]:
 
 def apply_minutes_penalty(
     scored_df: pd.DataFrame,
-    player_ids: List[int],
-    last_matches: int,
-    weight: float,
+    last_matches: int = 3,
+    weight: float = 0.7,
+    adjust_score: bool = True,
 ) -> pd.DataFrame:
-    """Apply minutes penalty to a subset of players.
+    """Add recent minutes columns and (optionally) penalize score.
 
-    Adds columns: minutes_last_n, minutes_games, minutes_ratio, avg_minutes.
-    Updates score := score * ((1-w) + w*minutes_ratio).
+    Uses /element-summary/{player_id}/ (public FPL API). We interpret
+    "recent" as the last N *played matches* in the history list.
 
-    If minutes data is missing, minutes_ratio defaults to 1.0 (no penalty).
+    Adds columns (always present after calling this):
+      - minutes_last_n
+      - minutes_games
+      - minutes_ratio  (0..1)
+      - avg_minutes
+
+    If adjust_score=True:
+      score := score * ((1-w) + w*minutes_ratio)
+
+    If minutes data is missing for a player, minutes_ratio defaults to 1.0
+    (no penalty).
     """
     if scored_df is None or scored_df.empty:
         return scored_df
+
+    n = max(0, int(last_matches))
+    w = max(0.0, min(1.0, float(weight)))
+
+    # Ensure columns exist even if n==0
+    if "minutes_last_n" not in scored_df.columns:
+        scored_df["minutes_last_n"] = 0
+    if "minutes_games" not in scored_df.columns:
+        scored_df["minutes_games"] = 0
+    if "minutes_ratio" not in scored_df.columns:
+        scored_df["minutes_ratio"] = 1.0
+    if "avg_minutes" not in scored_df.columns:
+        scored_df["avg_minutes"] = 90.0
+
+    if n == 0 or w == 0.0:
+        return scored_df
+
+    ids = [int(x) for x in scored_df.get("id", []).tolist()] if "id" in scored_df.columns else []
+    if not ids:
+        return scored_df
+
+    mins_sum = []
+    mins_games = []
+    ratio = []
+    avg = []
+
+    for pid in ids:
+        s, k = recent_minutes(pid, last_matches=n)
+        mins_sum.append(int(s))
+        mins_games.append(int(k))
+        denom = 90 * k if k else 0
+        r = (s / denom) if denom else 1.0
+        r = max(0.0, min(1.0, float(r)))
+        ratio.append(r)
+        avg.append((s / k) if k else 90.0)
+
+    scored_df["minutes_last_n"] = mins_sum
+    scored_df["minutes_games"] = mins_games
+    scored_df["minutes_ratio"] = ratio
+    scored_df["avg_minutes"] = avg
+
+    if adjust_score and "score" in scored_df.columns:
+        factor = (1.0 - w) + (w * scored_df["minutes_ratio"].astype(float))
+        scored_df["score"] = scored_df["score"].astype(float) * factor
+
+    # Default minutes columns (may be overridden by apply_minutes_penalty on subsets)
+    if "minutes_last_n" not in df.columns:
+        df["minutes_last_n"] = 0
+    if "minutes_games" not in df.columns:
+        df["minutes_games"] = 0
+    if "minutes_ratio" not in df.columns:
+        df["minutes_ratio"] = 1.0
+    if "avg_minutes" not in df.columns:
+        df["avg_minutes"] = 90.0
+
+    return scored_df
 
     n = max(0, int(last_matches))
     w = max(0.0, min(1.0, float(weight)))
@@ -422,6 +488,24 @@ def _score_players_base(
 # -------------------------
 # Views / suggestions
 # -------------------------
+
+
+def _score_players(
+    players_df: pd.DataFrame,
+    teams_df: pd.DataFrame,
+    fixtures_df: pd.DataFrame,
+    current_gw: int,
+    fixtures_ahead: int,
+) -> pd.DataFrame:
+    """Backwards-compatible wrapper used by UI code."""
+    return _score_players_base(
+        players_df=players_df,
+        teams_df=teams_df,
+        fixtures_df=fixtures_df,
+        current_gw=int(current_gw),
+        fixtures_ahead=int(fixtures_ahead),
+    )
+
 
 
 def show_current_team(
