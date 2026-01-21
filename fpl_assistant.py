@@ -506,6 +506,7 @@ class _Move:
     pos: str
     sell_cost_t: int
     buy_cost_t: int
+    bank_before_t: int  # bank before this step (tenths of million)
     bank_after_t: int  # bank after this step (tenths of million)
     gain: float
     priority: str
@@ -679,7 +680,8 @@ def suggest_transfer_plans(
 
                     prio, reason = _priority_for_move(sell_row, gain)
 
-                    new_bank_t = bank_after_sell_t - buy_cost_t
+                    bank_before_t = int(st.bank_t)
+                    new_bank_t = bank_before_t + sell_cost_t - buy_cost_t
                     new_squad_ids = [x for x in st.squad_ids if int(x) != int(sell_id)] + [buy_id]
 
                     new_counts = dict(counts_after_sell)
@@ -695,6 +697,7 @@ def suggest_transfer_plans(
                         pos=str(buy_row.get("position")),
                         sell_cost_t=sell_cost_t,
                         buy_cost_t=buy_cost_t,
+                        bank_before_t=bank_before_t,
                         bank_after_t=new_bank_t,
                         gain=round(gain, 3),
                         priority=prio,
@@ -731,6 +734,7 @@ def suggest_transfer_plans(
                     "ScoreGain": round(mv.gain, 2),
                     "SellPrice(m)": round(mv.sell_cost_t / 10.0, 1),
                     "BuyPrice(m)": round(mv.buy_cost_t / 10.0, 1),
+                    "BankBefore(m)": round(mv.bank_before_t / 10.0, 1),
                     "BankAfter(m)": round(mv.bank_after_t / 10.0, 1),
                     "Reason": mv.reason,
                 }
