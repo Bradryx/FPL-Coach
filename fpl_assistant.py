@@ -251,75 +251,64 @@ def recent_minutes(player_id: int, last_matches: int = 2) -> Tuple[int, int]:
 
 def apply_minutes_penalty(
     scored_df: pd.DataFrame,
-    last_matches: int = 3,
-    weight: float = 0.7,
-    adjust_score: bool = True,
+    player_ids: List[int],
+    last_matches: int,
+    weight: float,
 ) -> pd.DataFrame:
-    """Add recent minutes columns and (optionally) penalize score.
+    """Apply minutes penalty to a subset of players.
 
-    Uses /element-summary/{player_id}/ (public FPL API). "Recent" means the last
-    N *played matches* in the player's history list (so blanks/doubles are fine).
+    Adds columns: minutes_last_n, minutes_games, minutes_ratio, avg_minutes.
+    Updates score := score * ((1-w) + w*minutes_ratio).
 
-    Always adds columns:
-      - minutes_last_n
-      - minutes_games
-      - minutes_ratio  (0..1)
-      - avg_minutes
-
-    If adjust_score=True and last_matches>0 and weight>0:
-      score := score * ((1-w) + w*minutes_ratio)
-
-    If minutes data is missing for a player, minutes_ratio defaults to 1.0
-    (no penalty).
+    If minutes data is missing, minutes_ratio defaults to 1.0 (no penalty).
     """
     if scored_df is None or scored_df.empty:
         return scored_df
 
-    df = scored_df.copy()
-
-    # Ensure columns exist even when minutes disabled
-    df["minutes_last_n"] = 0
-    df["minutes_games"] = 0
-    df["minutes_ratio"] = 1.0
-    df["avg_minutes"] = 90.0
-
     n = max(0, int(last_matches))
     w = max(0.0, min(1.0, float(weight)))
-    if n == 0 or w == 0.0 or "id" not in df.columns:
-        return df
+    if n == 0 or w == 0.0 or not player_ids:
+        return scored_df
 
-    ids = [int(x) for x in df["id"].astype(int).tolist()]
+    df = scored_df.copy()
+    pid_set = {int(x) for x in player_ids}
 
-    mins_sum: List[int] = []
-    mins_games: List[int] = []
-    ratios: List[float] = []
-    avgs: List[float] = []
+    mins_sum: Dict[int, int] = {}
+    mins_games: Dict[int, int] = {}
+    mins_ratio: Dict[int, float] = {}
+    mins_avg: Dict[int, float] = {}
 
-    for pid in ids:
+    for pid in pid_set:
         s, k = recent_minutes(pid, last_matches=n)
-        mins_sum.append(int(s))
-        mins_games.append(int(k))
-        denom = 90 * k if k else 0
+        mins_sum[pid] = int(s)
+        mins_games[pid] = int(k)
+        denom = 90 * k
         r = (s / denom) if denom else 1.0
         r = max(0.0, min(1.0, float(r)))
-        ratios.append(r)
-        avgs.append((s / k) if k else 90.0)
+        mins_ratio[pid] = r
+        mins_avg[pid] = (s / k) if k else 90.0
 
-    df["minutes_last_n"] = mins_sum
-    df["minutes_games"] = mins_games
-    df["minutes_ratio"] = ratios
-    df["avg_minutes"] = avgs
+    df.loc[df["id"].astype(int).isin(pid_set), "minutes_last_n"] = df["id"].astype(int).map(mins_sum)
+    df.loc[df["id"].astype(int).isin(pid_set), "minutes_games"] = df["id"].astype(int).map(mins_games)
+    df.loc[df["id"].astype(int).isin(pid_set), "minutes_ratio"] = df["id"].astype(int).map(mins_ratio)
+    df.loc[df["id"].astype(int).isin(pid_set), "avg_minutes"] = df["id"].astype(int).map(mins_avg)
 
-    if adjust_score and "score" in df.columns:
-        factor = (1.0 - w) + (w * df["minutes_ratio"].astype(float))
-        df["score"] = df["score"].astype(float) * factor
+    # Default non-touched players
+    df["minutes_last_n"] = df.get("minutes_last_n", pd.Series([pd.NA] * len(df)))
+    df["minutes_games"] = df.get("minutes_games", pd.Series([pd.NA] * len(df)))
+    df["minutes_ratio"] = df.get("minutes_ratio", pd.Series([pd.NA] * len(df)))
+    df["avg_minutes"] = df.get("avg_minutes", pd.Series([pd.NA] * len(df)))
+
+    mask = df["id"].astype(int).isin(pid_set)
+    ratio = df.loc[mask, "minutes_ratio"].astype(float).fillna(1.0)
+    factor = (1.0 - w) + (w * ratio)
+    df.loc[mask, "score"] = df.loc[mask, "score"].astype(float) * factor
 
     return df
 
 
 # -------------------------
 # FDR (next N fixtures)
-# (next N fixtures)
 # -------------------------
 
 
@@ -435,24 +424,6 @@ def _score_players_base(
 # -------------------------
 
 
-def _score_players(
-    players_df: pd.DataFrame,
-    teams_df: pd.DataFrame,
-    fixtures_df: pd.DataFrame,
-    current_gw: int,
-    fixtures_ahead: int,
-) -> pd.DataFrame:
-    """Backwards-compatible wrapper used by UI code."""
-    return _score_players_base(
-        players_df=players_df,
-        teams_df=teams_df,
-        fixtures_df=fixtures_df,
-        current_gw=int(current_gw),
-        fixtures_ahead=int(fixtures_ahead),
-    )
-
-
-
 def show_current_team(
     manager_id: int,
     gameweek: int,
@@ -535,6 +506,7 @@ class _Move:
     pos: str
     sell_cost_t: int
     buy_cost_t: int
+    bank_after_t: int  # bank after this step (tenths of million)
     gain: float
     priority: str
     reason: str
@@ -723,6 +695,7 @@ def suggest_transfer_plans(
                         pos=str(buy_row.get("position")),
                         sell_cost_t=sell_cost_t,
                         buy_cost_t=buy_cost_t,
+                        bank_after_t=new_bank_t,
                         gain=round(gain, 3),
                         priority=prio,
                         reason=reason,
@@ -758,7 +731,7 @@ def suggest_transfer_plans(
                     "ScoreGain": round(mv.gain, 2),
                     "SellPrice(m)": round(mv.sell_cost_t / 10.0, 1),
                     "BuyPrice(m)": round(mv.buy_cost_t / 10.0, 1),
-                    "BankAfter(m)": round(st.bank_t / 10.0, 1),
+                    "BankAfter(m)": round(mv.bank_after_t / 10.0, 1),
                     "Reason": mv.reason,
                 }
             )
